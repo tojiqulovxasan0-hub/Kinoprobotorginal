@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  kinobot:
+    build: .
+    container_name: kino_bot
+    restart: unless-stopped          # Server restart bo'lsa bot o'zi qayta ishga tushadi
+    env_file:
+      - .env                         # Token va ID .env dan o'qiladi
+    volumes:
+      - ./data:/app/data             # Ma'lumotlar bazasi (kino_bot.db) saqlanadi
+    environment:
+      - DB_PATH=/app/data/kino_bot.db
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
