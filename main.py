@@ -645,11 +645,9 @@ class UserTrackerMiddleware(BaseMiddleware):
 
 class SubscriptionMiddleware(BaseMiddleware):
     """
-    Har xabarda (admin va check_sub bundan mustasno):
-    - Foydalanuvchi bazada bormi?
-    - Ro'yxatdan o'tganmi (is_registered)?
+    Har xabarda (admin va maxsus holatlardan tashqari):
+    - Foydalanuvchi bazada va ro'yxatdan o'tganmi?
     - Kanallarga obuna bo'lganmi?
-    Agar yo'q bo'lsa — bloklaydi.
     """
     async def __call__(
         self,
@@ -676,16 +674,19 @@ class SubscriptionMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
             return await handler(event, data)
 
-        # FSM holatini tekshirish — ro'yxatdan o'tish jarayonida bloklama
+        # FSM holatini tekshirish — RegisterForm holatida bloklama
+        # aiogram v3 da FSMContext data["state"] orqali keladi
         fsm_context: FSMContext | None = data.get("state")
+        current_state: str | None = None
         if fsm_context:
             try:
                 current_state = await fsm_context.get_state()
-                if current_state == RegisterForm.full_name.state:
-                    # Foydalanuvchi ism yozayapti — o'tkazib yuborish
-                    return await handler(event, data)
             except Exception:
-                pass
+                current_state = None
+
+        # Ro'yxatdan o'tish jarayonida (ism kiritish) — o'tkazib yuborish
+        if current_state and "RegisterForm" in str(current_state):
+            return await handler(event, data)
 
         # Foydalanuvchi bazada bormi?
         try:
@@ -704,26 +705,21 @@ class SubscriptionMiddleware(BaseMiddleware):
                 await event.answer("❌ /start bosing!", show_alert=True)
             return
 
-        # Ro'yxatdan o'tmagan — faqat FSM holatida emas bo'lsa bloklash
+        # Ro'yxatdan o'tmagan — agar boshqa FSM holatida ham bo'lsa o'tkazib yuborish
+        # (admin FSM holatlari ham shu yerda ishlaydi)
         if not u.get("is_registered"):
-            # FSM holatini qayta tekshirish (fsm_context oldindan tekshirilgan)
-            in_register = False
-            if fsm_context:
-                try:
-                    current_state = await fsm_context.get_state()
-                    if current_state and "RegisterForm" in str(current_state):
-                        in_register = True
-                except Exception:
-                    pass
-            if not in_register:
-                if isinstance(event, Message):
-                    await event.answer(
-                        "⚠️ Ro'yxatdan o'tish tugallanmagan.\n"
-                        "/start bosing va davom eting."
-                    )
-                elif isinstance(event, CallbackQuery):
-                    await event.answer("❌ /start bosing!", show_alert=True)
-                return
+            if current_state:
+                # Biron FSM holatida — handleriga o'tkazish (FSM o'zi hal qiladi)
+                return await handler(event, data)
+            # Hech qanday holat yo'q va ro'yxatdan o'tmagan
+            if isinstance(event, Message):
+                await event.answer(
+                    "⚠️ Ro'yxatdan o'tish tugallanmagan.\n"
+                    "/start bosing va davom eting."
+                )
+            elif isinstance(event, CallbackQuery):
+                await event.answer("❌ /start bosing!", show_alert=True)
+            return
 
         # Majburiy kanallarni tekshirish
         try:
@@ -1261,14 +1257,27 @@ async def _send_stat(target: Message | CallbackQuery) -> None:
         if isinstance(target, Message):
             await target.answer(text, reply_markup=kb_stat())
         else:
-            await target.message.edit_text(text, reply_markup=kb_stat())
+            try:
+                await target.message.edit_text(text, reply_markup=kb_stat())
+            except TelegramBadRequest:
+                # Matn o'zgarmagan — yangi xabar yuborish
+                await target.message.answer(text, reply_markup=kb_stat())
     except Exception as exc:
         logger.error("_send_stat: %s", exc, exc_info=True)
+        if isinstance(target, Message):
+            await target.answer("❌ Statistikani yuklashda xatolik.")
+        else:
+            await target.answer("❌ Xatolik.", show_alert=True)
 
 
 @admin_router.message(IsAdmin(), Command("stat"))
+@admin_router.message(IsAdmin(), Command("menu"))
 @admin_router.message(IsAdmin(), F.text == "📊 Statistika")
-async def cmd_stat(message: Message) -> None:
+async def cmd_stat(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if message.text and message.text.startswith("/menu"):
+        await message.answer("🏠 Admin panel", reply_markup=kb_admin_main())
+        return
     await _send_stat(message)
 
 
@@ -1404,21 +1413,33 @@ async def user_search_done(message: Message, state: FSMContext) -> None:
 @admin_router.callback_query(IsAdmin(), F.data.startswith("ubal_"))
 async def user_balance_start(call: CallbackQuery, state: FSMContext) -> None:
     try:
-        uid = int(call.data.split("_")[1])
+        parts = call.data.split("_")
+        if len(parts) < 2 or not parts[1].isdigit():
+            await call.answer("❌ Xato callback.", show_alert=True)
+            return
+        uid = int(parts[1])
+        u   = await db_get_user(uid)
+        if not u:
+            await call.answer("❌ Foydalanuvchi topilmadi.", show_alert=True)
+            return
+        cur_bal = u.get("balance", 0)
         await state.update_data(target_uid=uid)
         await state.set_state(UserBalanceForm.waiting)
-        u = await db_get_user(uid)
-        cur_bal = u.get("balance", 0) if u else 0
         await call.message.answer(
-            f"💰 Foydalanuvchi: <b>{u['full_name'] if u else uid}</b>\n"
-            f"Hozirgi balans: <b>{cur_bal} so'm</b>\n\n"
-            "Yangi miqdor kiriting:\n"
-            "<i>+500 → qo'shish | -200 → ayirish | 0 → nol</i>",
+            f"💰 <b>Balans o'zgartirish</b>\n\n"
+            f"👤 Foydalanuvchi: <b>{u['full_name']}</b>\n"
+            f"🆔 ID: <code>{uid}</code>\n"
+            f"💳 Hozirgi balans: <b>{cur_bal} so'm</b>\n\n"
+            "Miqdorni kiriting:\n"
+            "• <code>500</code> → +500 so'm qo'shish\n"
+            "• <code>-200</code> → 200 so'm ayirish\n"
+            "• <code>0</code> → nolga tushirish",
             reply_markup=kb_cancel(),
         )
         await call.answer()
     except Exception as exc:
         logger.error("user_balance_start: %s", exc, exc_info=True)
+        await call.answer("❌ Xatolik.", show_alert=True)
 
 
 @admin_router.message(IsAdmin(), StateFilter(UserBalanceForm.waiting))
@@ -1473,14 +1494,20 @@ async def user_balance_done(message: Message, state: FSMContext, bot: Bot) -> No
 @admin_router.callback_query(IsAdmin(), F.data.startswith("uzero_"))
 async def user_balance_zero(call: CallbackQuery, bot: Bot) -> None:
     try:
-        uid = int(call.data.split("_")[1])
+        parts = call.data.split("_")
+        if len(parts) < 2 or not parts[1].isdigit():
+            await call.answer("❌ Xato callback.", show_alert=True)
+            return
+        uid = int(parts[1])
+        u   = await db_get_user(uid)
+        name = u["full_name"] if u else str(uid)
         await db_set_balance(uid, 0)
-        await call.answer("✅ Balans 0 ga tushirildi.", show_alert=True)
+        await call.answer(f"✅ {name} balansi 0 ga tushirildi.", show_alert=True)
         try:
             await bot.send_message(
                 uid,
                 "ℹ️ <b>Balansingiz 0 ga tushirildi.</b>\n"
-                "Murojaat uchun adminlarga bog'laning.",
+                "Savol bo'lsa adminlarga bog'laning.",
             )
         except Exception:
             pass
@@ -1492,16 +1519,20 @@ async def user_balance_zero(call: CallbackQuery, bot: Bot) -> None:
 @admin_router.callback_query(IsAdmin(), F.data.startswith("uref_"))
 async def user_ref_stat(call: CallbackQuery) -> None:
     try:
-        uid    = int(call.data.split("_")[1])
-        today  = await db_get_user_refs_today(uid)
-        week   = await db_get_user_refs_period(uid, 7)
-        month  = await db_get_user_refs_period(uid, 30)
-        u      = await db_get_user(uid)
-        total  = u.get("ref_count", 0) if u else 0
-        name   = u["full_name"] if u else str(uid)
+        parts = call.data.split("_")
+        if len(parts) < 2 or not parts[1].isdigit():
+            await call.answer("❌ Xato callback.", show_alert=True)
+            return
+        uid   = int(parts[1])
+        today = await db_get_user_refs_today(uid)
+        week  = await db_get_user_refs_period(uid, 7)
+        month = await db_get_user_refs_period(uid, 30)
+        u     = await db_get_user(uid)
+        total = u.get("ref_count", 0) if u else 0
+        name  = u["full_name"] if u else str(uid)
         await call.answer(
             f"👤 {name}\n"
-            f"👥 Referallar:\n"
+            f"─────────────\n"
             f"Bugun: {today}\n"
             f"1 hafta: {week}\n"
             f"1 oy: {month}\n"
@@ -2059,6 +2090,19 @@ async def broadcast_cancel(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.answer("❌ Reklama bekor qilindi.", reply_markup=kb_admin_main())
     except Exception as exc:
         logger.error("broadcast_cancel: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), Command("panel"))
+async def cmd_panel(message: Message, state: FSMContext) -> None:
+    """Admin keyboard yo'qolsa /panel bilan qayta oladi."""
+    try:
+        await state.clear()
+        await message.answer(
+            "🏠 <b>Admin Panel</b>",
+            reply_markup=kb_admin_main(),
+        )
+    except Exception as exc:
+        logger.error("cmd_panel: %s", exc, exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════
