@@ -676,11 +676,16 @@ class SubscriptionMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
             return await handler(event, data)
 
-        # reg_name callback — ro'yxatdan o'tish jarayoni, o'tkazib yuborish
-        if isinstance(event, CallbackQuery) and (
-            event.data == "reg_confirm" or event.data == "reg_cancel"
-        ):
-            return await handler(event, data)
+        # FSM holatini tekshirish — ro'yxatdan o'tish jarayonida bloklama
+        fsm_context: FSMContext | None = data.get("state")
+        if fsm_context:
+            try:
+                current_state = await fsm_context.get_state()
+                if current_state == RegisterForm.full_name.state:
+                    # Foydalanuvchi ism yozayapti — o'tkazib yuborish
+                    return await handler(event, data)
+            except Exception:
+                pass
 
         # Foydalanuvchi bazada bormi?
         try:
@@ -699,16 +704,26 @@ class SubscriptionMiddleware(BaseMiddleware):
                 await event.answer("❌ /start bosing!", show_alert=True)
             return
 
-        # Ro'yxatdan o'tmagan (ism kiritmagan) — /start ga yo'naltirish
+        # Ro'yxatdan o'tmagan — faqat FSM holatida emas bo'lsa bloklash
         if not u.get("is_registered"):
-            if isinstance(event, Message):
-                await event.answer(
-                    "⚠️ Ro'yxatdan o'tish tugallanmagan.\n"
-                    "/start bosing va ro'yxatdan o'ting."
-                )
-            elif isinstance(event, CallbackQuery):
-                await event.answer("❌ Avval ro'yxatdan o'ting! /start", show_alert=True)
-            return
+            # FSM holatini qayta tekshirish (fsm_context oldindan tekshirilgan)
+            in_register = False
+            if fsm_context:
+                try:
+                    current_state = await fsm_context.get_state()
+                    if current_state and "RegisterForm" in str(current_state):
+                        in_register = True
+                except Exception:
+                    pass
+            if not in_register:
+                if isinstance(event, Message):
+                    await event.answer(
+                        "⚠️ Ro'yxatdan o'tish tugallanmagan.\n"
+                        "/start bosing va davom eting."
+                    )
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("❌ /start bosing!", show_alert=True)
+                return
 
         # Majburiy kanallarni tekshirish
         try:
