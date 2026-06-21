@@ -298,7 +298,8 @@ def kb_cancel() -> ReplyKeyboardMarkup:
     return b.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
-def kb_subscribe(channels: list[str]) -> InlineKeyboardMarkup:
+def _build_subscribe_kb(channels: list[str]) -> InlineKeyboardMarkup:
+    """Obuna tugmalari + Tekshirish tugmasi."""
     b = InlineKeyboardBuilder()
     for ch in channels:
         b.row(InlineKeyboardButton(
@@ -309,6 +310,10 @@ def kb_subscribe(channels: list[str]) -> InlineKeyboardMarkup:
         text="✅ Obunani Tekshirish", callback_data="check_sub"
     ))
     return b.as_markup()
+
+
+# Alias — eski kod ham ishlashi uchun
+kb_subscribe = _build_subscribe_kb
 
 
 def kb_stat() -> InlineKeyboardMarkup:
@@ -359,41 +364,84 @@ class UserTrackerMiddleware(BaseMiddleware):
                 logger.error("UserTracker xatosi: %s", exc)
         return await handler(event, data)
 
+
+class SubscriptionMiddleware(BaseMiddleware):
+    """
+    Har bir Message kelganda (admin bundan mustasno):
+    - Majburiy kanallarga obunani tekshiradi
+    - Obuna bo'lmagan bo'lsa — xabar bloklanadi, tugmalar ko'rsatiladi
+    - 'check_sub' callback va admin xabarlari o'tkazib yuboriladi
+    """
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        # Faqat Message va CallbackQuery uchun ishlaydi
+        if not isinstance(event, (Message, CallbackQuery)):
+            return await handler(event, data)
+
+        user = event.from_user
+        if not user or user.is_bot:
+            return await handler(event, data)
+
+        # Admin uchun tekshiruv yo'q
+        if user.id == ADMIN_ID:
+            return await handler(event, data)
+
+        # "Tekshirish" callback — bu middlewaredan o'tadi (handler o'zi hal qiladi)
+        if isinstance(event, CallbackQuery) and event.data == "check_sub":
+            return await handler(event, data)
+
+        # Kanallar ro'yxatini olish
+        try:
+            channels = await db_get_channels()
+        except Exception as exc:
+            logger.error("SubscriptionMiddleware db_get_channels: %s", exc)
+            return await handler(event, data)
+
+        # Kanallar yo'q — o'tkazib yuborish
+        if not channels:
+            return await handler(event, data)
+
+        # Obuna tekshirish
+        bot: Bot = data["bot"]
+        not_subbed: list[str] = []
+        for ch in channels:
+            try:
+                member = await bot.get_chat_member(chat_id=ch, user_id=user.id)
+                if member.status in ("left", "kicked"):
+                    not_subbed.append(ch)
+            except TelegramForbiddenError:
+                logger.warning("Bot %s kanalda admin emas — o'tkazildi.", ch)
+            except TelegramBadRequest as exc:
+                logger.warning("get_chat_member (%s): %s", ch, exc)
+            except Exception as exc:
+                logger.error("SubscriptionMiddleware check (%s): %s", ch, exc)
+
+        if not_subbed:
+            # Foydalanuvchi obuna bo'lmagan — bloklash
+            kb = _build_subscribe_kb(not_subbed)
+            if isinstance(event, Message):
+                await event.answer(
+                    "⚠️ <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>",
+                    reply_markup=kb,
+                )
+            elif isinstance(event, CallbackQuery):
+                await event.answer(
+                    "❌ Avval kanallarga obuna bo'ling!", show_alert=True
+                )
+            return  # Handleriga o'tkazmaymiz
+
+        # Hammaga obuna — davom etsin
+        return await handler(event, data)
+
 # ──────────────────────────────────────────────────────────────
 # YORDAMCHI FUNKSIYALAR
 # ──────────────────────────────────────────────────────────────
 
-async def check_subscription(bot: Bot, user_id: int) -> list[str]:
-    """Obuna bo'lmagan kanallar ro'yxatini qaytaradi."""
-    channels = await db_get_channels()
-    not_subbed: list[str] = []
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
-            if member.status in ("left", "kicked"):
-                not_subbed.append(ch)
-        except TelegramForbiddenError:
-            logger.warning("Bot %s kanalda admin emas.", ch)
-        except TelegramBadRequest as exc:
-            logger.warning("get_chat_member (%s): %s", ch, exc)
-        except Exception as exc:
-            logger.error("check_subscription (%s): %s", ch, exc)
-    return not_subbed
 
-
-async def subscription_guard(message: Message, bot: Bot) -> bool:
-    """True = o'tsin, False = obuna xabari ko'rsatildi."""
-    channels = await db_get_channels()
-    if not channels:
-        return True
-    not_subbed = await check_subscription(bot, message.from_user.id)
-    if not_subbed:
-        await message.answer(
-            "⚠️ <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>",
-            reply_markup=kb_subscribe(not_subbed),
-        )
-        return False
-    return True
 
 
 def build_stat_text(total: int, today: int, online: int, top: list[dict]) -> str:
@@ -465,8 +513,6 @@ user_router  = Router()   # Umumiy + foydalanuvchi
 @user_router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot) -> None:
     try:
-        if not await subscription_guard(message, bot):
-            return
         if message.from_user.id == ADMIN_ID:
             await message.answer(
                 "👋 Xush kelibsiz, <b>Admin</b>!\nBot boshqaruvi paneliga xush kelibsiz.",
@@ -487,8 +533,6 @@ async def cmd_start(message: Message, bot: Bot) -> None:
 @user_router.message(F.text == "ℹ️ Yordam")
 async def cmd_help(message: Message, bot: Bot) -> None:
     try:
-        if not await subscription_guard(message, bot):
-            return
         await message.answer(
             "ℹ️ <b>Yordam</b>\n\n"
             "🎬 Kino kodini yozing — bot kinoni yuboradi.\n"
@@ -501,15 +545,43 @@ async def cmd_help(message: Message, bot: Bot) -> None:
 
 @user_router.callback_query(F.data == "check_sub")
 async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
+    """'Tekshirish' tugmasi — obunani qayta tekshiradi."""
     try:
-        not_subbed = await check_subscription(bot, call.from_user.id)
+        channels = await db_get_channels()
+        if not channels:
+            # Kanallar o'chirilgan — ruxsat
+            await call.answer("✅ Ruxsat berildi!", show_alert=True)
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
+            await call.message.answer(
+                f"👋 Salom, <b>{call.from_user.full_name}</b>!\n\n"
+                "🎬 Kino kodini yozing.\nMasalan: <code>125</code>",
+                reply_markup=kb_main_user(),
+            )
+            return
+
+        not_subbed: list[str] = []
+        for ch in channels:
+            try:
+                member = await bot.get_chat_member(chat_id=ch, user_id=call.from_user.id)
+                if member.status in ("left", "kicked"):
+                    not_subbed.append(ch)
+            except TelegramForbiddenError:
+                logger.warning("Bot %s kanalda admin emas.", ch)
+            except TelegramBadRequest as exc:
+                logger.warning("get_chat_member (%s): %s", ch, exc)
+            except Exception as exc:
+                logger.error("check_sub_cb check (%s): %s", ch, exc)
+
         if not_subbed:
             await call.answer(
                 "❌ Hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True
             )
             try:
                 await call.message.edit_reply_markup(
-                    reply_markup=kb_subscribe(not_subbed)
+                    reply_markup=_build_subscribe_kb(not_subbed)
                 )
             except Exception:
                 pass
@@ -519,19 +591,15 @@ async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
                 await call.message.delete()
             except Exception:
                 pass
-            if call.from_user.id == ADMIN_ID:
-                await call.message.answer(
-                    "👋 Xush kelibsiz, <b>Admin</b>!", reply_markup=kb_admin_main()
-                )
-            else:
-                await call.message.answer(
-                    "✅ Obuna tasdiqlandi! Kino kodini yuboring.\n"
-                    "Masalan: <code>125</code>",
-                    reply_markup=kb_main_user(),
-                )
+            await call.message.answer(
+                f"✅ Obuna tasdiqlandi!\n\n"
+                f"👋 Salom, <b>{call.from_user.full_name}</b>!\n"
+                "🎬 Kino kodini yozing.\nMasalan: <code>125</code>",
+                reply_markup=kb_main_user(),
+            )
     except Exception as exc:
         logger.error("check_sub_cb: %s", exc, exc_info=True)
-        await call.answer("❌ Xatolik.", show_alert=True)
+        await call.answer("❌ Xatolik yuz berdi.", show_alert=True)
 
 # ══════════════════════════════════════════════════════════════
 # FOYDALANUVCHI — kino qidirish (user_router)
@@ -552,25 +620,13 @@ async def ask_movie_code(message: Message) -> None:
 
 @user_router.message(
     F.text.regexp(r"^\d+$"),
-    StateFilter(None),       # ← KALIT: faqat hech qanday state yo'qda ishlaydi
+    StateFilter(None),       # ← faqat hech qanday FSM state yo'qda ishlaydi
 )
 async def search_movie(message: Message, bot: Bot) -> None:
     """Foydalanuvchi raqam (kino kodi) yuborganda kinoni topib yuboradi."""
-    # Admin bu handlerga tushmasligi uchun
     if message.from_user.id == ADMIN_ID:
         return
     try:
-        # Obuna tekshirish
-        channels = await db_get_channels()
-        if channels:
-            not_subbed = await check_subscription(bot, message.from_user.id)
-            if not_subbed:
-                await message.answer(
-                    "⚠️ <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>",
-                    reply_markup=kb_subscribe(not_subbed),
-                )
-                return
-
         kino_kod = message.text.strip()
         movie = await db_get_movie(kino_kod)
         if not movie:
@@ -1085,6 +1141,9 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(UserTrackerMiddleware())
     dp.callback_query.middleware(UserTrackerMiddleware())
+    # Obuna tekshiruvi — har bir xabar va callback uchun (admin bundan mustasno)
+    dp.message.middleware(SubscriptionMiddleware())
+    dp.callback_query.middleware(SubscriptionMiddleware())
 
     # TARTIB MUHIM:
     # 1. admin_router — birinchi (FSM state lari priority oladi)
