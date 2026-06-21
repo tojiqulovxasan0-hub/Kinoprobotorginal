@@ -101,9 +101,25 @@ async def init_db() -> None:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_username TEXT UNIQUE NOT NULL
+                channel_username TEXT UNIQUE NOT NULL,
+                channel_type     TEXT NOT NULL DEFAULT 'telegram',
+                channel_url      TEXT,
+                channel_title    TEXT
             )
         """)
+        # Eski bazada ustun bo'lmasa qo'shamiz (migration)
+        try:
+            await db.execute("ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'telegram'")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE channels ADD COLUMN channel_url TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE channels ADD COLUMN channel_title TEXT")
+        except Exception:
+            pass
         await db.commit()
     logger.info("Ma'lumotlar bazasi ishga tushirildi.")
 
@@ -227,15 +243,43 @@ async def db_get_top_movies(limit: int = 10) -> list[dict]:
 
 
 def _norm_ch(username: str) -> str:
-    return username if username.startswith("@") else f"@{username}"
+    """
+    Har qanday formatdagi kanal kiritishni @username ga aylantiradi.
+    Qabul qiladi:
+      @majburiykanal22
+      majburiykanal22
+      https://t.me/majburiykanal22
+      t.me/majburiykanal22
+    """
+    username = username.strip()
+    # https://t.me/username  yoki  t.me/username  formatini tozalash
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if username.lower().startswith(prefix):
+            username = username[len(prefix):]
+            break
+    # @ belgisini olib tashlash va qayta qo'shish
+    username = username.lstrip("@").strip()
+    # Bo'sh bo'lib qolmagan bo'lsa @ qo'shamiz
+    if username:
+        return f"@{username}"
+    return ""
 
 
-async def db_add_channel(username: str) -> bool:
-    username = _norm_ch(username)
+async def db_add_channel(username: str, ch_type: str = "telegram",
+                         url: str = "", title: str = "") -> bool:
+    """
+    Kanal qo'shish.
+    ch_type: 'telegram' | 'instagram' | 'youtube' | 'other'
+    """
+    username = _norm_ch(username) if ch_type == "telegram" else username.strip()
+    if not username:
+        return False
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT INTO channels (channel_username) VALUES (?)", (username,)
+                "INSERT INTO channels (channel_username, channel_type, channel_url, channel_title)"
+                " VALUES (?,?,?,?)",
+                (username, ch_type, url, title),
             )
             await db.commit()
         return True
@@ -244,19 +288,30 @@ async def db_add_channel(username: str) -> bool:
 
 
 async def db_remove_channel(username: str) -> bool:
-    username = _norm_ch(username)
+    """username bo'yicha kanalni o'chirish."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # To'g'ridan username bilan o'chirishga urinamiz
         cur = await db.execute(
             "DELETE FROM channels WHERE channel_username=?", (username,)
         )
+        if cur.rowcount == 0:
+            # _norm_ch bilan ham urinamiz
+            normed = _norm_ch(username)
+            cur = await db.execute(
+                "DELETE FROM channels WHERE channel_username=?", (normed,)
+            )
         await db.commit()
         return cur.rowcount > 0
 
 
-async def db_get_channels() -> list[str]:
+async def db_get_channels() -> list[dict]:
+    """Barcha kanallarni dict ko'rinishida qaytaradi."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT channel_username FROM channels")
-        return [r[0] for r in await cur.fetchall()]
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT channel_username, channel_type, channel_url, channel_title FROM channels"
+        )
+        return [dict(r) for r in await cur.fetchall()]
 
 # ──────────────────────────────────────────────────────────────
 # KLAVIATURALAR
@@ -298,21 +353,42 @@ def kb_cancel() -> ReplyKeyboardMarkup:
     return b.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
-def _build_subscribe_kb(channels: list[str]) -> InlineKeyboardMarkup:
-    """Obuna tugmalari + Tekshirish tugmasi."""
+def _build_subscribe_kb(not_subbed: list[dict]) -> InlineKeyboardMarkup:
+    """
+    Obuna bo'lmagan kanallar uchun tugmalar.
+    Telegram → t.me havolasi
+    Instagram → instagram.com havolasi
+    YouTube → youtube.com havolasi
+    """
     b = InlineKeyboardBuilder()
-    for ch in channels:
-        b.row(InlineKeyboardButton(
-            text=f"➕ {ch} kanaliga obuna bo'ling",
-            url=f"https://t.me/{ch.lstrip('@')}",
-        ))
+    for ch in not_subbed:
+        ch_type = ch.get("channel_type", "telegram")
+        username = ch["channel_username"]
+        title = ch.get("channel_title") or username
+        url = ch.get("channel_url") or ""
+
+        if ch_type == "telegram":
+            link = f"https://t.me/{username.lstrip('@')}"
+            btn_text = f"📢 {title} — Obuna bo'ling"
+        elif ch_type == "instagram":
+            link = url or f"https://instagram.com/{username.lstrip('@')}"
+            btn_text = f"📸 Instagram: {title} — Kuzating"
+        elif ch_type == "youtube":
+            link = url or f"https://youtube.com/@{username.lstrip('@')}"
+            btn_text = f"▶️ YouTube: {title} — Obuna bo'ling"
+        else:
+            link = url or f"https://t.me/{username.lstrip('@')}"
+            btn_text = f"🔗 {title} — Kuzating"
+
+        b.row(InlineKeyboardButton(text=btn_text, url=link))
+
     b.row(InlineKeyboardButton(
         text="✅ Obunani Tekshirish", callback_data="check_sub"
     ))
     return b.as_markup()
 
 
-# Alias — eski kod ham ishlashi uchun
+# Alias
 kb_subscribe = _build_subscribe_kb
 
 
@@ -325,7 +401,16 @@ def kb_stat() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def kb_broadcast_confirm() -> InlineKeyboardMarkup:
+def kb_channel_type() -> InlineKeyboardMarkup:
+    """Kanal turini tanlash."""
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📢 Telegram kanal", callback_data="chtype_telegram"))
+    b.row(InlineKeyboardButton(text="👥 Telegram guruh", callback_data="chtype_telegram"))
+    b.row(InlineKeyboardButton(text="🤖 Telegram bot", callback_data="chtype_telegram"))
+    b.row(InlineKeyboardButton(text="📸 Instagram", callback_data="chtype_instagram"))
+    b.row(InlineKeyboardButton(text="▶️ YouTube", callback_data="chtype_youtube"))
+    b.row(InlineKeyboardButton(text="❌ Bekor qilish", callback_data="chtype_cancel"))
+    return b.as_markup()
     b = InlineKeyboardBuilder()
     b.add(InlineKeyboardButton(text="✅ Ha, Yuborish", callback_data="confirm_broadcast"))
     b.add(InlineKeyboardButton(text="❌ Bekor", callback_data="cancel_broadcast"))
@@ -367,10 +452,10 @@ class UserTrackerMiddleware(BaseMiddleware):
 
 class SubscriptionMiddleware(BaseMiddleware):
     """
-    Har bir Message kelganda (admin bundan mustasno):
-    - Majburiy kanallarga obunani tekshiradi
-    - Obuna bo'lmagan bo'lsa — xabar bloklanadi, tugmalar ko'rsatiladi
-    - 'check_sub' callback va admin xabarlari o'tkazib yuboriladi
+    Har bir xabarda (admin bundan mustasno) obunani tekshiradi.
+    - Telegram kanal/guruh/bot: get_chat_member() bilan tekshiriladi
+    - Instagram / YouTube: faqat havola ko'rsatiladi (API yo'q)
+    - 'check_sub' callback o'tkazib yuboriladi
     """
     async def __call__(
         self,
@@ -378,7 +463,6 @@ class SubscriptionMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        # Faqat Message va CallbackQuery uchun ishlaydi
         if not isinstance(event, (Message, CallbackQuery)):
             return await handler(event, data)
 
@@ -390,7 +474,7 @@ class SubscriptionMiddleware(BaseMiddleware):
         if user.id == ADMIN_ID:
             return await handler(event, data)
 
-        # "Tekshirish" callback — bu middlewaredan o'tadi (handler o'zi hal qiladi)
+        # "Tekshirish" tugmasi — o'tkazib yuborish (handler o'zi hal qiladi)
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
             return await handler(event, data)
 
@@ -401,40 +485,59 @@ class SubscriptionMiddleware(BaseMiddleware):
             logger.error("SubscriptionMiddleware db_get_channels: %s", exc)
             return await handler(event, data)
 
-        # Kanallar yo'q — o'tkazib yuborish
         if not channels:
             return await handler(event, data)
 
-        # Obuna tekshirish
         bot: Bot = data["bot"]
-        not_subbed: list[str] = []
+        not_subbed: list[dict] = []
+
         for ch in channels:
-            try:
-                member = await bot.get_chat_member(chat_id=ch, user_id=user.id)
-                if member.status in ("left", "kicked"):
-                    not_subbed.append(ch)
-            except TelegramForbiddenError:
-                logger.warning("Bot %s kanalda admin emas — o'tkazildi.", ch)
-            except TelegramBadRequest as exc:
-                logger.warning("get_chat_member (%s): %s", ch, exc)
-            except Exception as exc:
-                logger.error("SubscriptionMiddleware check (%s): %s", ch, exc)
+            ch_type = ch.get("channel_type", "telegram")
+
+            if ch_type == "telegram":
+                # Telegram — get_chat_member bilan haqiqiy tekshiruv
+                try:
+                    member = await bot.get_chat_member(
+                        chat_id=ch["channel_username"], user_id=user.id
+                    )
+                    if member.status in ("left", "kicked"):
+                        not_subbed.append(ch)
+                except TelegramForbiddenError:
+                    logger.warning(
+                        "Bot %s kanalda admin emas — o'tkazildi.", ch["channel_username"]
+                    )
+                except TelegramBadRequest as exc:
+                    logger.warning("get_chat_member (%s): %s", ch["channel_username"], exc)
+                except Exception as exc:
+                    logger.error(
+                        "SubscriptionMiddleware Telegram check (%s): %s",
+                        ch["channel_username"], exc
+                    )
+            else:
+                # Instagram / YouTube — tekshirib bo'lmaydi,
+                # lekin foydalanuvchi "Tekshirdim" bosmaguncha bloklaymiz.
+                # Buning uchun bazada maxsus "confirmed" flag kerak bo'lardi,
+                # lekin oddiy yechim: har doim not_subbed ga qo'shamiz
+                # va foydalanuvchi "Tekshirish" bosganda biz Telegram kanallarni
+                # tekshiramiz (Instagram/YouTube ni o'tkazib yuboramiz).
+                # Demak: Instagram/YouTube faqat birinchi marta ko'rsatiladi,
+                # "Tekshirish" bosgandan keyin ular o'tmaydi.
+                not_subbed.append(ch)
 
         if not_subbed:
-            # Foydalanuvchi obuna bo'lmagan — bloklash
             kb = _build_subscribe_kb(not_subbed)
             if isinstance(event, Message):
                 await event.answer(
-                    "⚠️ <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>",
+                    "⚠️ <b>Botdan foydalanish uchun quyidagi joylarga obuna bo'ling:</b>\n\n"
+                    "📌 Obuna bo'lgandan so'ng <b>«✅ Obunani Tekshirish»</b> tugmasini bosing.",
                     reply_markup=kb,
                 )
             elif isinstance(event, CallbackQuery):
                 await event.answer(
-                    "❌ Avval kanallarga obuna bo'ling!", show_alert=True
+                    "❌ Avval barcha joylarga obuna bo'ling!", show_alert=True
                 )
-            return  # Handleriga o'tkazmaymiz
+            return
 
-        # Hammaga obuna — davom etsin
         return await handler(event, data)
 
 # ──────────────────────────────────────────────────────────────
@@ -488,8 +591,11 @@ class DeleteMovieForm(StatesGroup):
 
 
 class ChannelForm(StatesGroup):
-    add    = State()
-    remove = State()
+    choose_type = State()   # Kanal turini tanlash
+    add_username = State()  # Username/link kiritish
+    add_title = State()     # Sarlavha kiritish (ixtiyoriy)
+    add_url = State()       # To'liq URL (YouTube/Instagram uchun)
+    remove = State()        # O'chirish uchun username
 
 
 class BroadcastForm(StatesGroup):
@@ -545,39 +651,45 @@ async def cmd_help(message: Message, bot: Bot) -> None:
 
 @user_router.callback_query(F.data == "check_sub")
 async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
-    """'Tekshirish' tugmasi — obunani qayta tekshiradi."""
+    """'Tekshirish' tugmasi — Telegram kanallarni tekshiradi."""
     try:
         channels = await db_get_channels()
         if not channels:
-            # Kanallar o'chirilgan — ruxsat
             await call.answer("✅ Ruxsat berildi!", show_alert=True)
             try:
                 await call.message.delete()
             except Exception:
                 pass
             await call.message.answer(
-                f"👋 Salom, <b>{call.from_user.full_name}</b>!\n\n"
-                "🎬 Kino kodini yozing.\nMasalan: <code>125</code>",
+                f"👋 Salom, <b>{call.from_user.full_name}</b>!\n"
+                "🎬 Kino kodini yozing. Masalan: <code>125</code>",
                 reply_markup=kb_main_user(),
             )
             return
 
-        not_subbed: list[str] = []
+        not_subbed: list[dict] = []
         for ch in channels:
+            ch_type = ch.get("channel_type", "telegram")
+            if ch_type != "telegram":
+                # Instagram/YouTube tekshirib bo'lmaydi — o'tkazib yuboramiz
+                continue
             try:
-                member = await bot.get_chat_member(chat_id=ch, user_id=call.from_user.id)
+                member = await bot.get_chat_member(
+                    chat_id=ch["channel_username"], user_id=call.from_user.id
+                )
                 if member.status in ("left", "kicked"):
                     not_subbed.append(ch)
             except TelegramForbiddenError:
-                logger.warning("Bot %s kanalda admin emas.", ch)
+                logger.warning("Bot %s kanalda admin emas.", ch["channel_username"])
             except TelegramBadRequest as exc:
-                logger.warning("get_chat_member (%s): %s", ch, exc)
+                logger.warning("check_sub_cb (%s): %s", ch["channel_username"], exc)
             except Exception as exc:
-                logger.error("check_sub_cb check (%s): %s", ch, exc)
+                logger.error("check_sub_cb (%s): %s", ch["channel_username"], exc)
 
         if not_subbed:
             await call.answer(
-                "❌ Hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True
+                "❌ Hali barcha Telegram kanallarga obuna bo'lmagansiz!",
+                show_alert=True,
             )
             try:
                 await call.message.edit_reply_markup(
@@ -592,9 +704,9 @@ async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
             except Exception:
                 pass
             await call.message.answer(
-                f"✅ Obuna tasdiqlandi!\n\n"
+                f"✅ <b>Obuna tasdiqlandi!</b>\n\n"
                 f"👋 Salom, <b>{call.from_user.full_name}</b>!\n"
-                "🎬 Kino kodini yozing.\nMasalan: <code>125</code>",
+                "🎬 Kino kodini yozing. Masalan: <code>125</code>",
                 reply_markup=kb_main_user(),
             )
     except Exception as exc:
@@ -730,39 +842,189 @@ async def back_to_main(message: Message, state: FSMContext) -> None:
 @admin_router.message(IsAdmin(), F.text == "➕ Kanal Qo'shish")
 async def channel_add_start(message: Message, state: FSMContext) -> None:
     try:
-        await state.set_state(ChannelForm.add)
+        await state.set_state(ChannelForm.choose_type)
         await message.answer(
-            "➕ Kanal username'ini yuboring.\nMasalan: <code>@kanal_username</code>",
-            reply_markup=kb_cancel(),
+            "➕ <b>Kanal qo'shish</b>\n\n"
+            "Qo'shmoqchi bo'lgan kanalning turini tanlang:",
+            reply_markup=kb_channel_type(),
         )
     except Exception as exc:
         logger.error("channel_add_start: %s", exc, exc_info=True)
 
 
-@admin_router.message(IsAdmin(), StateFilter(ChannelForm.add))
-async def channel_add_done(message: Message, state: FSMContext) -> None:
+@admin_router.callback_query(IsAdmin(), F.data.startswith("chtype_"), StateFilter(ChannelForm.choose_type))
+async def channel_choose_type(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        ch_type_raw = call.data.replace("chtype_", "")
+
+        if ch_type_raw == "cancel":
+            await state.clear()
+            await call.message.edit_text("❌ Bekor qilindi.")
+            await call.message.answer("🏠 Kanallar menyusi", reply_markup=kb_admin_channels())
+            return
+
+        # Telegram kanal/guruh/bot uchun bir xil tip
+        ch_type = ch_type_raw  # 'telegram', 'instagram', 'youtube'
+
+        await state.update_data(ch_type=ch_type)
+        await state.set_state(ChannelForm.add_title)
+        await call.message.edit_text(
+            f"✏️ <b>Sarlavha</b> kiriting\n"
+            f"(Tugmalarda ko'rinadigan nom, masalan: <code>Rasmiy kanal</code>):"
+        )
+    except Exception as exc:
+        logger.error("channel_choose_type: %s", exc, exc_info=True)
+        await call.answer("❌ Xatolik.", show_alert=True)
+
+
+@admin_router.message(IsAdmin(), StateFilter(ChannelForm.add_title))
+async def channel_add_title(message: Message, state: FSMContext) -> None:
     try:
         if message.text == "❌ Bekor Qilish":
             await state.clear()
             await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_channels())
             return
-        username = (message.text or "").strip()
-        if not username:
-            await message.answer("❌ Username bo'sh bo'lmasin.")
+
+        title = (message.text or "").strip()
+        if not title:
+            await message.answer("❌ Sarlavha bo'sh bo'lmasin. Qayta yuboring:")
             return
-        success = await db_add_channel(username)
-        await state.clear()
-        uname = _norm_ch(username)
-        if success:
+
+        data = await state.get_data()
+        ch_type = data["ch_type"]
+        await state.update_data(ch_title=title)
+        await state.set_state(ChannelForm.add_username)
+
+        if ch_type == "telegram":
             await message.answer(
-                f"✅ <b>{uname}</b> qo'shildi.", reply_markup=kb_admin_channels()
+                "📢 <b>Telegram username</b> kiriting:\n\n"
+                "✅ To'g'ri: <code>@majburiykanal</code>\n"
+                "✅ To'g'ri: <code>majburiykanal</code>\n\n"
+                "⚠️ Bot o'sha kanalda <b>admin</b> bo'lishi shart!",
+                reply_markup=kb_cancel(),
             )
-        else:
+        elif ch_type == "instagram":
             await message.answer(
-                f"⚠️ <b>{uname}</b> allaqachon mavjud.", reply_markup=kb_admin_channels()
+                "📸 <b>Instagram username</b> kiriting:\n\n"
+                "✅ To'g'ri: <code>@username</code>\n"
+                "✅ To'g'ri: <code>username</code>\n"
+                "✅ To'g'ri: <code>https://instagram.com/username</code>",
+                reply_markup=kb_cancel(),
+            )
+        elif ch_type == "youtube":
+            await message.answer(
+                "▶️ <b>YouTube kanal havolasini</b> kiriting:\n\n"
+                "✅ To'g'ri: <code>https://youtube.com/@kanal</code>\n"
+                "✅ To'g'ri: <code>@kanal</code>",
+                reply_markup=kb_cancel(),
             )
     except Exception as exc:
-        logger.error("channel_add_done: %s", exc, exc_info=True)
+        logger.error("channel_add_title: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), StateFilter(ChannelForm.add_username))
+async def channel_add_username(message: Message, state: FSMContext) -> None:
+    try:
+        if message.text == "❌ Bekor Qilish":
+            await state.clear()
+            await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_channels())
+            return
+
+        raw = (message.text or "").strip()
+        if not raw:
+            await message.answer("❌ Bo'sh bo'lmasin. Qayta yuboring:")
+            return
+
+        data = await state.get_data()
+        ch_type = data["ch_type"]
+        title = data["ch_title"]
+
+        if ch_type == "telegram":
+            username = _norm_ch(raw)
+            if not username:
+                await message.answer(
+                    "❌ Noto'g'ri format. Masalan: <code>@majburiykanal</code>"
+                )
+                return
+            url = f"https://t.me/{username.lstrip('@')}"
+            success = await db_add_channel(username, ch_type, url, title)
+            await state.clear()
+            if success:
+                await message.answer(
+                    f"✅ Telegram kanal qo'shildi!\n\n"
+                    f"📢 Sarlavha: <b>{title}</b>\n"
+                    f"🔗 Username: <code>{username}</code>\n\n"
+                    f"⚠️ Eslatma: Bot <b>{username}</b> kanalida <b>admin</b> bo'lishi shart!",
+                    reply_markup=kb_admin_channels(),
+                )
+            else:
+                await message.answer(
+                    f"⚠️ <b>{username}</b> allaqachon ro'yxatda mavjud.",
+                    reply_markup=kb_admin_channels(),
+                )
+
+        elif ch_type == "instagram":
+            # Instagram URL ni normallashtirish
+            username_clean = raw
+            for prefix in ("https://instagram.com/", "https://www.instagram.com/",
+                           "instagram.com/", "www.instagram.com/"):
+                if username_clean.lower().startswith(prefix):
+                    username_clean = username_clean[len(prefix):]
+                    break
+            username_clean = username_clean.lstrip("@").rstrip("/").strip()
+            if not username_clean:
+                await message.answer("❌ Noto'g'ri format. Qayta yuboring:")
+                return
+            url = f"https://instagram.com/{username_clean}"
+            db_key = f"ig_{username_clean}"
+            success = await db_add_channel(db_key, ch_type, url, title)
+            await state.clear()
+            if success:
+                await message.answer(
+                    f"✅ Instagram qo'shildi!\n\n"
+                    f"📸 Sarlavha: <b>{title}</b>\n"
+                    f"🔗 Havola: {url}\n\n"
+                    f"ℹ️ Instagram obunasi foydalanuvchi tomonidan tasdiqlanadi.",
+                    reply_markup=kb_admin_channels(),
+                )
+            else:
+                await message.answer(
+                    f"⚠️ Bu Instagram allaqachon ro'yxatda.",
+                    reply_markup=kb_admin_channels(),
+                )
+
+        elif ch_type == "youtube":
+            # YouTube URL ni normallashtirish
+            raw_yt = raw
+            for prefix in ("https://youtube.com/", "https://www.youtube.com/",
+                           "youtube.com/", "www.youtube.com/"):
+                if raw_yt.lower().startswith(prefix):
+                    raw_yt = raw_yt[len(prefix):]
+                    break
+            raw_yt = raw_yt.lstrip("@").rstrip("/").strip()
+            if not raw_yt:
+                await message.answer("❌ Noto'g'ri format. Qayta yuboring:")
+                return
+            url = f"https://youtube.com/@{raw_yt}"
+            db_key = f"yt_{raw_yt}"
+            success = await db_add_channel(db_key, ch_type, url, title)
+            await state.clear()
+            if success:
+                await message.answer(
+                    f"✅ YouTube qo'shildi!\n\n"
+                    f"▶️ Sarlavha: <b>{title}</b>\n"
+                    f"🔗 Havola: {url}\n\n"
+                    f"ℹ️ YouTube obunasi foydalanuvchi tomonidan tasdiqlanadi.",
+                    reply_markup=kb_admin_channels(),
+                )
+            else:
+                await message.answer(
+                    f"⚠️ Bu YouTube allaqachon ro'yxatda.",
+                    reply_markup=kb_admin_channels(),
+                )
+
+    except Exception as exc:
+        logger.error("channel_add_username: %s", exc, exc_info=True)
         await state.clear()
         await message.answer("❌ Xatolik.", reply_markup=kb_admin_channels())
 
@@ -774,10 +1036,15 @@ async def channel_remove_start(message: Message, state: FSMContext) -> None:
         if not channels:
             await message.answer("📭 Ro'yxat bo'sh.", reply_markup=kb_admin_channels())
             return
-        text = "➖ O'chirmoqchi bo'lgan kanal username'ini yuboring.\n\n"
-        text += "<b>Mavjud kanallar:</b>\n" + "\n".join(
-            f"{i}. {ch}" for i, ch in enumerate(channels, 1)
-        )
+
+        type_icons = {"telegram": "📢", "instagram": "📸", "youtube": "▶️"}
+        lines = []
+        for i, ch in enumerate(channels, 1):
+            icon = type_icons.get(ch.get("channel_type", "telegram"), "🔗")
+            title = ch.get("channel_title") or ch["channel_username"]
+            lines.append(f"{i}. {icon} {title} — <code>{ch['channel_username']}</code>")
+
+        text = "➖ <b>O'chirish uchun username'ini yuboring:</b>\n\n" + "\n".join(lines)
         await state.set_state(ChannelForm.remove)
         await message.answer(text, reply_markup=kb_cancel())
     except Exception as exc:
@@ -794,14 +1061,15 @@ async def channel_remove_done(message: Message, state: FSMContext) -> None:
         username = (message.text or "").strip()
         deleted  = await db_remove_channel(username)
         await state.clear()
-        uname = _norm_ch(username)
         if deleted:
             await message.answer(
-                f"✅ <b>{uname}</b> o'chirildi.", reply_markup=kb_admin_channels()
+                f"✅ <b>{username}</b> ro'yxatdan o'chirildi.",
+                reply_markup=kb_admin_channels(),
             )
         else:
             await message.answer(
-                f"❌ <b>{uname}</b> topilmadi.", reply_markup=kb_admin_channels()
+                f"❌ <b>{username}</b> topilmadi. To'liq username'ni yuboring.",
+                reply_markup=kb_admin_channels(),
             )
     except Exception as exc:
         logger.error("channel_remove_done: %s", exc, exc_info=True)
@@ -818,10 +1086,22 @@ async def list_channels(message: Message) -> None:
                 "📭 Hali hech qanday kanal yo'q.", reply_markup=kb_admin_channels()
             )
             return
-        text = "📋 <b>Majburiy Kanallar:</b>\n\n" + "\n".join(
-            f"{i}. {ch}" for i, ch in enumerate(channels, 1)
-        )
-        await message.answer(text, reply_markup=kb_admin_channels())
+
+        type_icons = {"telegram": "📢", "instagram": "📸", "youtube": "▶️"}
+        type_names = {"telegram": "Telegram", "instagram": "Instagram", "youtube": "YouTube"}
+        lines = ["📋 <b>Majburiy Obuna Ro'yxati:</b>\n"]
+        for i, ch in enumerate(channels, 1):
+            ch_type = ch.get("channel_type", "telegram")
+            icon = type_icons.get(ch_type, "🔗")
+            type_name = type_names.get(ch_type, "Boshqa")
+            title = ch.get("channel_title") or ch["channel_username"]
+            url = ch.get("channel_url") or ""
+            lines.append(
+                f"{i}. {icon} <b>{title}</b> [{type_name}]\n"
+                f"   📌 <code>{ch['channel_username']}</code>"
+            )
+
+        await message.answer("\n".join(lines), reply_markup=kb_admin_channels())
     except Exception as exc:
         logger.error("list_channels: %s", exc, exc_info=True)
 
