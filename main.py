@@ -1,13 +1,12 @@
-# ╔══════════════════════════════════════════════════════════╗
-# ║          KINO BOT — Yagona fayl (main.py)               ║
-# ║  Barcha handlerlar, DB, klaviatura — hammasi shu yerda  ║
-# ╚══════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║   KINO BOT  — To'liq versiya (referal, balans, yordamchi admin) ║
+# ╚══════════════════════════════════════════════════════════════════╝
 
 import asyncio
 import logging
 import os
 import sys
-from collections.abc import Callable, Awaitable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,38 +16,29 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import (
-    TelegramBadRequest,
-    TelegramForbiddenError,
-    TelegramRetryAfter,
-)
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import BaseFilter, Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    BufferedInputFile,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    TelegramObject,
+    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
+    InlineKeyboardMarkup, KeyboardButton, Message,
+    ReplyKeyboardMarkup, TelegramObject,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 # CONFIG
-# ──────────────────────────────────────────────────────────────
-
+# ═══════════════════════════════════════════════════════════════
 load_dotenv()
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
-_admin_raw: str = os.getenv("ADMIN_ID", "").strip()
-DB_PATH: str = os.getenv("DB_PATH", "kino_bot.db")
+BOT_TOKEN: str      = os.getenv("BOT_TOKEN", "").strip()
+_admin_raw: str     = os.getenv("ADMIN_ID", "").strip()
+DB_PATH: str        = os.getenv("DB_PATH", "kino_bot.db")
 ONLINE_MINUTES: int = int(os.getenv("ONLINE_MINUTES", "10"))
+REFERRAL_BONUS: int = int(os.getenv("REFERRAL_BONUS", "100"))   # so'm
 
 if not BOT_TOKEN:
     sys.exit("❌ BOT_TOKEN .env faylida topilmadi!")
@@ -58,10 +48,9 @@ if not _admin_raw or not _admin_raw.isdigit():
 ADMIN_ID: int = int(_admin_raw)
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 # LOGGING
-# ──────────────────────────────────────────────────────────────
-
+# ═══════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -72,22 +61,41 @@ logger = logging.getLogger(__name__)
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
-# ──────────────────────────────────────────────────────────────
-# DATABASE
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# DATABASE — jadvallar va barcha funksiyalar
+# ═══════════════════════════════════════════════════════════════
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
+
+        # Foydalanuvchilar
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                full_name   TEXT,
-                join_date   TEXT NOT NULL,
-                last_active TEXT NOT NULL
+                user_id      INTEGER PRIMARY KEY,
+                username     TEXT,
+                full_name    TEXT,
+                join_date    TEXT NOT NULL,
+                last_active  TEXT NOT NULL,
+                referrer_id  INTEGER DEFAULT NULL,
+                balance      INTEGER DEFAULT 0,
+                ref_count    INTEGER DEFAULT 0
             )
         """)
+        # Migration — eski bazaga ustunlar qo'shish
+        for col, defval in [
+            ("referrer_id", "NULL"),
+            ("balance",     "0"),
+            ("ref_count",   "0"),
+        ]:
+            try:
+                await db.execute(
+                    f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT {defval}"
+                )
+            except Exception:
+                pass
+
+        # Kinolar
         await db.execute("""
             CREATE TABLE IF NOT EXISTS movies (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,33 +106,52 @@ async def init_db() -> None:
                 views_count  INTEGER DEFAULT 0
             )
         """)
+
+        # Majburiy kanallar (faqat Telegram)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel_username TEXT UNIQUE NOT NULL,
-                channel_type     TEXT NOT NULL DEFAULT 'telegram',
-                channel_url      TEXT,
                 channel_title    TEXT
             )
         """)
-        # Eski bazada ustun bo'lmasa qo'shamiz (migration)
-        try:
-            await db.execute("ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'telegram'")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channels ADD COLUMN channel_url TEXT")
-        except Exception:
-            pass
         try:
             await db.execute("ALTER TABLE channels ADD COLUMN channel_title TEXT")
         except Exception:
             pass
+
+        # Yordamchi adminlar
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS support_admins (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL
+            )
+        """)
+
         await db.commit()
     logger.info("Ma'lumotlar bazasi ishga tushirildi.")
 
 
-async def db_add_or_update_user(user_id: int, username: str | None, full_name: str) -> None:
+# ───────────────────────────────────────────────────────────────
+# FOYDALANUVCHILAR
+# ───────────────────────────────────────────────────────────────
+
+async def db_get_user(user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def db_add_or_update_user(
+    user_id: int, username: str | None, full_name: str,
+    referrer_id: int | None = None
+) -> bool:
+    """
+    Foydalanuvchini qo'shadi yoki yangilaydi.
+    Qaytaradi: True — yangi foydalanuvchi, False — allaqachon bor
+    """
     now = datetime.now().isoformat(timespec="seconds")
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
@@ -134,12 +161,46 @@ async def db_add_or_update_user(user_id: int, username: str | None, full_name: s
                 "UPDATE users SET username=?, full_name=?, last_active=? WHERE user_id=?",
                 (username, full_name, now, user_id),
             )
+            await db.commit()
+            return False
         else:
             await db.execute(
-                "INSERT INTO users (user_id, username, full_name, join_date, last_active)"
-                " VALUES (?,?,?,?,?)",
-                (user_id, username, full_name, now, now),
+                "INSERT INTO users (user_id, username, full_name, join_date, last_active,"
+                " referrer_id, balance, ref_count) VALUES (?,?,?,?,?,?,0,0)",
+                (user_id, username, full_name, now, now, referrer_id),
             )
+            await db.commit()
+            return True
+
+
+async def db_add_referral_bonus(referrer_id: int, bonus: int = REFERRAL_BONUS) -> None:
+    """Referal egasiga bonus qo'shish va ref_count oshirish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET balance=balance+?, ref_count=ref_count+1 WHERE user_id=?",
+            (bonus, referrer_id),
+        )
+        await db.commit()
+
+
+async def db_update_balance(user_id: int, amount: int) -> int:
+    """Balansni o'zgartirish (amount manfiy ham bo'lishi mumkin). Yangi balansni qaytaradi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id)
+        )
+        await db.commit()
+        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def db_set_balance(user_id: int, amount: int) -> None:
+    """Balansni aniq qiymatga o'rnatish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET balance=? WHERE user_id=?", (amount, user_id)
+        )
         await db.commit()
 
 
@@ -147,7 +208,8 @@ async def db_get_all_users() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT user_id, username, full_name, join_date FROM users ORDER BY join_date DESC"
+            "SELECT user_id, username, full_name, join_date, balance, ref_count"
+            " FROM users ORDER BY join_date DESC"
         )
         return [dict(r) for r in await cur.fetchall()]
 
@@ -169,6 +231,17 @@ async def db_get_today_count() -> int:
         return row[0] if row else 0
 
 
+async def db_get_period_count(days: int) -> int:
+    """So'nggi N kun ichida qo'shilgan foydalanuvchilar."""
+    threshold = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM users WHERE join_date >= ?", (threshold,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
 async def db_get_online_count() -> int:
     threshold = (datetime.now() - timedelta(minutes=ONLINE_MINUTES)).isoformat(timespec="seconds")
     async with aiosqlite.connect(DB_PATH) as db:
@@ -184,6 +257,44 @@ async def db_get_all_user_ids() -> list[int]:
         cur = await db.execute("SELECT user_id FROM users")
         return [r[0] for r in await cur.fetchall()]
 
+
+async def db_get_top_referrers(limit: int = 10) -> list[dict]:
+    """Eng ko'p referal qilganlar reytingi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT user_id, username, full_name, ref_count, balance"
+            " FROM users ORDER BY ref_count DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_get_user_refs_today(user_id: int) -> int:
+    """Foydalanuvchi bugun taklif qilgan odamlar soni."""
+    today = datetime.now().date().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM users WHERE referrer_id=? AND join_date LIKE ?",
+            (user_id, f"{today}%"),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def db_get_user_refs_period(user_id: int, days: int) -> int:
+    threshold = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM users WHERE referrer_id=? AND join_date >= ?",
+            (user_id, threshold),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+# ───────────────────────────────────────────────────────────────
+# KINOLAR
+# ───────────────────────────────────────────────────────────────
 
 async def db_add_movie(kod: str, nom: str, tavsif: str, file_id: str) -> bool:
     try:
@@ -242,44 +353,30 @@ async def db_get_top_movies(limit: int = 10) -> list[dict]:
         return [dict(r) for r in await cur.fetchall()]
 
 
+# ───────────────────────────────────────────────────────────────
+# MAJBURIY KANALLAR (faqat Telegram)
+# ───────────────────────────────────────────────────────────────
+
 def _norm_ch(username: str) -> str:
-    """
-    Har qanday formatdagi kanal kiritishni @username ga aylantiradi.
-    Qabul qiladi:
-      @majburiykanal22
-      majburiykanal22
-      https://t.me/majburiykanal22
-      t.me/majburiykanal22
-    """
+    """Kanal username'ini @username formatiga o'tkazish."""
     username = username.strip()
-    # https://t.me/username  yoki  t.me/username  formatini tozalash
     for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
         if username.lower().startswith(prefix):
             username = username[len(prefix):]
             break
-    # @ belgisini olib tashlash va qayta qo'shish
-    username = username.lstrip("@").strip()
-    # Bo'sh bo'lib qolmagan bo'lsa @ qo'shamiz
-    if username:
-        return f"@{username}"
-    return ""
+    username = username.lstrip("@").strip().rstrip("/")
+    return f"@{username}" if username else ""
 
 
-async def db_add_channel(username: str, ch_type: str = "telegram",
-                         url: str = "", title: str = "") -> bool:
-    """
-    Kanal qo'shish.
-    ch_type: 'telegram' | 'instagram' | 'youtube' | 'other'
-    """
-    username = _norm_ch(username) if ch_type == "telegram" else username.strip()
+async def db_add_channel(username: str, title: str = "") -> bool:
+    username = _norm_ch(username)
     if not username:
         return False
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT INTO channels (channel_username, channel_type, channel_url, channel_title)"
-                " VALUES (?,?,?,?)",
-                (username, ch_type, url, title),
+                "INSERT INTO channels (channel_username, channel_title) VALUES (?,?)",
+                (username, title),
             )
             await db.commit()
         return True
@@ -288,38 +385,68 @@ async def db_add_channel(username: str, ch_type: str = "telegram",
 
 
 async def db_remove_channel(username: str) -> bool:
-    """username bo'yicha kanalni o'chirish."""
+    normed = _norm_ch(username) if not username.startswith("@") else username
     async with aiosqlite.connect(DB_PATH) as db:
-        # To'g'ridan username bilan o'chirishga urinamiz
         cur = await db.execute(
-            "DELETE FROM channels WHERE channel_username=?", (username,)
+            "DELETE FROM channels WHERE channel_username=?", (normed,)
         )
         if cur.rowcount == 0:
-            # _norm_ch bilan ham urinamiz
-            normed = _norm_ch(username)
             cur = await db.execute(
-                "DELETE FROM channels WHERE channel_username=?", (normed,)
+                "DELETE FROM channels WHERE channel_username=?", (username,)
             )
         await db.commit()
         return cur.rowcount > 0
 
 
 async def db_get_channels() -> list[dict]:
-    """Barcha kanallarni dict ko'rinishida qaytaradi."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT channel_username, channel_type, channel_url, channel_title FROM channels"
-        )
+        cur = await db.execute("SELECT channel_username, channel_title FROM channels")
         return [dict(r) for r in await cur.fetchall()]
 
-# ──────────────────────────────────────────────────────────────
+
+# ───────────────────────────────────────────────────────────────
+# YORDAMCHI ADMINLAR
+# ───────────────────────────────────────────────────────────────
+
+async def db_add_support(username: str) -> bool:
+    username = username.strip().lstrip("@")
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO support_admins (username) VALUES (?)", (username,)
+            )
+            await db.commit()
+        return True
+    except aiosqlite.IntegrityError:
+        return False
+
+
+async def db_remove_support(username: str) -> bool:
+    username = username.strip().lstrip("@")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM support_admins WHERE username=?", (username,)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def db_get_supports() -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT username FROM support_admins")
+        return [r[0] for r in await cur.fetchall()]
+
+# ═══════════════════════════════════════════════════════════════
 # KLAVIATURALAR
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
 def kb_main_user() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.add(KeyboardButton(text="🎬 Kino Qidirish"))
+    b.add(KeyboardButton(text="👤 Profilim"))
+    b.add(KeyboardButton(text="🔗 Referal Havola"))
+    b.add(KeyboardButton(text="🏆 Reyting"))
     b.add(KeyboardButton(text="ℹ️ Yordam"))
     b.adjust(2)
     return b.as_markup(resize_keyboard=True)
@@ -332,7 +459,10 @@ def kb_admin_main() -> ReplyKeyboardMarkup:
     b.add(KeyboardButton(text="📋 Kinolar Ro'yxati"))
     b.add(KeyboardButton(text="📢 Reklama Yuborish"))
     b.add(KeyboardButton(text="📊 Statistika"))
-    b.add(KeyboardButton(text="⚙️ Kanallar Boshqaruvi"))
+    b.add(KeyboardButton(text="⚙️ Kanallar"))
+    b.add(KeyboardButton(text="👥 Foydalanuvchilar"))
+    b.add(KeyboardButton(text="🏆 Reyting"))
+    b.add(KeyboardButton(text="🛠 Yordamchi Adminlar"))
     b.adjust(2)
     return b.as_markup(resize_keyboard=True)
 
@@ -347,88 +477,87 @@ def kb_admin_channels() -> ReplyKeyboardMarkup:
     return b.as_markup(resize_keyboard=True)
 
 
+def kb_admin_users() -> ReplyKeyboardMarkup:
+    b = ReplyKeyboardBuilder()
+    b.add(KeyboardButton(text="🔍 Foydalanuvchi Izlash"))
+    b.add(KeyboardButton(text="📥 Ro'yxat (TXT)"))
+    b.add(KeyboardButton(text="🔙 Orqaga"))
+    b.adjust(2)
+    return b.as_markup(resize_keyboard=True)
+
+
+def kb_admin_support() -> ReplyKeyboardMarkup:
+    b = ReplyKeyboardBuilder()
+    b.add(KeyboardButton(text="➕ Admin Qo'shish"))
+    b.add(KeyboardButton(text="➖ Admin O'chirish"))
+    b.add(KeyboardButton(text="📋 Adminlar Ro'yxati"))
+    b.add(KeyboardButton(text="🔙 Orqaga"))
+    b.adjust(2)
+    return b.as_markup(resize_keyboard=True)
+
+
 def kb_cancel() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.add(KeyboardButton(text="❌ Bekor Qilish"))
     return b.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
-def _build_subscribe_kb(not_subbed: list[dict]) -> InlineKeyboardMarkup:
-    """
-    Obuna bo'lmagan kanallar uchun tugmalar.
-    Telegram → t.me havolasi
-    Instagram → instagram.com havolasi
-    YouTube → youtube.com havolasi
-    """
+def kb_subscribe(channels: list[dict]) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for ch in not_subbed:
-        ch_type = ch.get("channel_type", "telegram")
-        username = ch["channel_username"]
-        title = ch.get("channel_title") or username
-        url = ch.get("channel_url") or ""
-
-        if ch_type == "telegram":
-            link = f"https://t.me/{username.lstrip('@')}"
-            btn_text = f"📢 {title} — Obuna bo'ling"
-        elif ch_type == "instagram":
-            link = url or f"https://instagram.com/{username.lstrip('@')}"
-            btn_text = f"📸 Instagram: {title} — Kuzating"
-        elif ch_type == "youtube":
-            link = url or f"https://youtube.com/@{username.lstrip('@')}"
-            btn_text = f"▶️ YouTube: {title} — Obuna bo'ling"
-        else:
-            link = url or f"https://t.me/{username.lstrip('@')}"
-            btn_text = f"🔗 {title} — Kuzating"
-
-        b.row(InlineKeyboardButton(text=btn_text, url=link))
-
-    b.row(InlineKeyboardButton(
-        text="✅ Obunani Tekshirish", callback_data="check_sub"
-    ))
+    for ch in channels:
+        title = ch.get("channel_title") or ch["channel_username"]
+        uname = ch["channel_username"].lstrip("@")
+        b.row(InlineKeyboardButton(
+            text=f"📢 {title} — Obuna bo'ling",
+            url=f"https://t.me/{uname}",
+        ))
+    b.row(InlineKeyboardButton(text="✅ Obunani Tekshirish", callback_data="check_sub"))
     return b.as_markup()
-
-
-# Alias
-kb_subscribe = _build_subscribe_kb
 
 
 def kb_stat() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="🔄 Yangilash", callback_data="refresh_stat"))
-    b.row(InlineKeyboardButton(
-        text="📥 Foydalanuvchilar (TXT)", callback_data="download_users"
-    ))
+    b.row(InlineKeyboardButton(text="📥 Foydalanuvchilar (TXT)", callback_data="download_users"))
     return b.as_markup()
 
 
-def kb_channel_type() -> InlineKeyboardMarkup:
-    """Kanal turini tanlash."""
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="📢 Telegram kanal", callback_data="chtype_telegram"))
-    b.row(InlineKeyboardButton(text="👥 Telegram guruh", callback_data="chtype_telegram"))
-    b.row(InlineKeyboardButton(text="🤖 Telegram bot", callback_data="chtype_telegram"))
-    b.row(InlineKeyboardButton(text="📸 Instagram", callback_data="chtype_instagram"))
-    b.row(InlineKeyboardButton(text="▶️ YouTube", callback_data="chtype_youtube"))
-    b.row(InlineKeyboardButton(text="❌ Bekor qilish", callback_data="chtype_cancel"))
-    return b.as_markup()
+def kb_broadcast_confirm() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.add(InlineKeyboardButton(text="✅ Ha, Yuborish", callback_data="confirm_broadcast"))
     b.add(InlineKeyboardButton(text="❌ Bekor", callback_data="cancel_broadcast"))
     b.adjust(2)
     return b.as_markup()
 
-# ──────────────────────────────────────────────────────────────
-# FILTR VA MIDDLEWARE
-# ──────────────────────────────────────────────────────────────
+
+def kb_user_manage(user_id: int) -> InlineKeyboardMarkup:
+    """Admin — foydalanuvchini boshqarish tugmalari."""
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(
+        text="💰 Balans o'zgartirish", callback_data=f"ubal_{user_id}"
+    ))
+    b.row(InlineKeyboardButton(
+        text="🔄 Balansni nolga tushirish", callback_data=f"uzero_{user_id}"
+    ))
+    b.row(InlineKeyboardButton(
+        text="📊 Referal statistikasi", callback_data=f"uref_{user_id}"
+    ))
+    return b.as_markup()
+
+# ═══════════════════════════════════════════════════════════════
+# FILTRLAR
+# ═══════════════════════════════════════════════════════════════
 
 class IsAdmin(BaseFilter):
-    """Faqat ADMIN_ID ga ruxsat beruvchi filtr."""
     async def __call__(self, event: Message | CallbackQuery) -> bool:
         return event.from_user.id == ADMIN_ID
 
 
+# ═══════════════════════════════════════════════════════════════
+# MIDDLEWARE — Foydalanuvchi tracker
+# ═══════════════════════════════════════════════════════════════
+
 class UserTrackerMiddleware(BaseMiddleware):
-    """Har bir xabarda foydalanuvchini bazaga qo'shadi/yangilaydi."""
     async def __call__(
         self,
         handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
@@ -446,17 +575,15 @@ class UserTrackerMiddleware(BaseMiddleware):
                     full_name=user.full_name or str(user.id),
                 )
             except Exception as exc:
-                logger.error("UserTracker xatosi: %s", exc)
+                logger.error("UserTracker: %s", exc)
         return await handler(event, data)
 
 
+# ═══════════════════════════════════════════════════════════════
+# MIDDLEWARE — Majburiy obuna tekshiruvi
+# ═══════════════════════════════════════════════════════════════
+
 class SubscriptionMiddleware(BaseMiddleware):
-    """
-    Har bir xabarda (admin bundan mustasno) obunani tekshiradi.
-    - Telegram kanal/guruh/bot: get_chat_member() bilan tekshiriladi
-    - Instagram / YouTube: faqat havola ko'rsatiladi (API yo'q)
-    - 'check_sub' callback o'tkazib yuboriladi
-    """
     async def __call__(
         self,
         handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
@@ -470,19 +597,18 @@ class SubscriptionMiddleware(BaseMiddleware):
         if not user or user.is_bot:
             return await handler(event, data)
 
-        # Admin uchun tekshiruv yo'q
+        # Admin — tekshiruv yo'q
         if user.id == ADMIN_ID:
             return await handler(event, data)
 
-        # "Tekshirish" tugmasi — o'tkazib yuborish (handler o'zi hal qiladi)
+        # check_sub callback — handler o'zi hal qiladi
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
             return await handler(event, data)
 
-        # Kanallar ro'yxatini olish
         try:
             channels = await db_get_channels()
         except Exception as exc:
-            logger.error("SubscriptionMiddleware db_get_channels: %s", exc)
+            logger.error("SubMiddleware db: %s", exc)
             return await handler(event, data)
 
         if not channels:
@@ -490,168 +616,282 @@ class SubscriptionMiddleware(BaseMiddleware):
 
         bot: Bot = data["bot"]
         not_subbed: list[dict] = []
-
         for ch in channels:
-            ch_type = ch.get("channel_type", "telegram")
-
-            if ch_type == "telegram":
-                # Telegram — get_chat_member bilan haqiqiy tekshiruv
-                try:
-                    member = await bot.get_chat_member(
-                        chat_id=ch["channel_username"], user_id=user.id
-                    )
-                    if member.status in ("left", "kicked"):
-                        not_subbed.append(ch)
-                except TelegramForbiddenError:
-                    logger.warning(
-                        "Bot %s kanalda admin emas — o'tkazildi.", ch["channel_username"]
-                    )
-                except TelegramBadRequest as exc:
-                    logger.warning("get_chat_member (%s): %s", ch["channel_username"], exc)
-                except Exception as exc:
-                    logger.error(
-                        "SubscriptionMiddleware Telegram check (%s): %s",
-                        ch["channel_username"], exc
-                    )
-            else:
-                # Instagram / YouTube — tekshirib bo'lmaydi,
-                # lekin foydalanuvchi "Tekshirdim" bosmaguncha bloklaymiz.
-                # Buning uchun bazada maxsus "confirmed" flag kerak bo'lardi,
-                # lekin oddiy yechim: har doim not_subbed ga qo'shamiz
-                # va foydalanuvchi "Tekshirish" bosganda biz Telegram kanallarni
-                # tekshiramiz (Instagram/YouTube ni o'tkazib yuboramiz).
-                # Demak: Instagram/YouTube faqat birinchi marta ko'rsatiladi,
-                # "Tekshirish" bosgandan keyin ular o'tmaydi.
-                not_subbed.append(ch)
+            try:
+                member = await bot.get_chat_member(
+                    chat_id=ch["channel_username"], user_id=user.id
+                )
+                if member.status in ("left", "kicked"):
+                    not_subbed.append(ch)
+            except TelegramForbiddenError:
+                logger.warning("Bot %s da admin emas.", ch["channel_username"])
+            except TelegramBadRequest as exc:
+                logger.warning("get_chat_member (%s): %s", ch["channel_username"], exc)
+            except Exception as exc:
+                logger.error("SubMiddleware check (%s): %s", ch["channel_username"], exc)
 
         if not_subbed:
-            kb = _build_subscribe_kb(not_subbed)
             if isinstance(event, Message):
                 await event.answer(
-                    "⚠️ <b>Botdan foydalanish uchun quyidagi joylarga obuna bo'ling:</b>\n\n"
-                    "📌 Obuna bo'lgandan so'ng <b>«✅ Obunani Tekshirish»</b> tugmasini bosing.",
-                    reply_markup=kb,
+                    "⚠️ <b>Botdan foydalanish uchun kanallarga obuna bo'ling:</b>\n\n"
+                    "Obuna bo'lgach <b>«✅ Obunani Tekshirish»</b> tugmasini bosing.",
+                    reply_markup=kb_subscribe(not_subbed),
                 )
             elif isinstance(event, CallbackQuery):
-                await event.answer(
-                    "❌ Avval barcha joylarga obuna bo'ling!", show_alert=True
-                )
+                await event.answer("❌ Avval kanallarga obuna bo'ling!", show_alert=True)
             return
 
         return await handler(event, data)
 
-# ──────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════
 # YORDAMCHI FUNKSIYALAR
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
-
-
-
-def build_stat_text(total: int, today: int, online: int, top: list[dict]) -> str:
+def build_stat_text(total: int, today: int, online: int,
+                    week: int, month: int, top_movies: list[dict]) -> str:
     lines = [
         "📊 <b>Bot Statistikasi</b>\n",
         f"👥 Jami foydalanuvchilar: <b>{total}</b>",
         f"🆕 Bugun yangi: <b>{today}</b>",
-        f"🟢 Online (oxirgi {ONLINE_MINUTES} daqiqa): <b>{online}</b>\n",
-        "🏆 <b>Top-10 Ko'p Ko'rilgan Kinolar:</b>",
+        f"📅 1 hafta: <b>{week}</b>",
+        f"📆 1 oy: <b>{month}</b>",
+        f"🟢 Online (~{ONLINE_MINUTES} daqiqa): <b>{online}</b>\n",
+        "🏆 <b>Top-10 Ko'rilgan Kinolar:</b>",
     ]
-    if top:
-        for i, m in enumerate(top, 1):
+    if top_movies:
+        for i, m in enumerate(top_movies, 1):
             lines.append(
-                f"  {i}. <code>{m['kino_kod']}</code> — {m['kino_nomi']} "
-                f"<i>({m['views_count']} marta)</i>"
+                f"  {i}. <code>{m['kino_kod']}</code> — {m['kino_nomi']}"
+                f" <i>({m['views_count']} marta)</i>"
             )
     else:
-        lines.append("  Hali birorta kino qo'shilmagan.")
+        lines.append("  Hali kino qo'shilmagan.")
     return "\n".join(lines)
 
 
 def build_users_txt(users: list[dict]) -> bytes:
-    lines = ["ID | Username | Ism-Familiya | Qo'shilgan sana\n", "-" * 60 + "\n"]
+    lines = ["ID | Username | Ism | Balans | Referallar | Qo'shilgan\n", "-"*70+"\n"]
     for u in users:
         uname = f"@{u['username']}" if u.get("username") else "—"
         lines.append(
-            f"{u['user_id']} | {uname} | {u['full_name']} | {u['join_date'][:10]}\n"
+            f"{u['user_id']} | {uname} | {u['full_name']} |"
+            f" {u.get('balance',0)} so'm | {u.get('ref_count',0)} | {u['join_date'][:10]}\n"
         )
     return "".join(lines).encode("utf-8")
 
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 # FSM HOLATLARI
-# ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 
 class AddMovieForm(StatesGroup):
-    kod   = State()
-    nom   = State()
+    kod    = State()
+    nom    = State()
     tavsif = State()
     video  = State()
-
 
 class DeleteMovieForm(StatesGroup):
     kod = State()
 
-
 class ChannelForm(StatesGroup):
-    choose_type = State()   # Kanal turini tanlash
-    add_username = State()  # Username/link kiritish
-    add_title = State()     # Sarlavha kiritish (ixtiyoriy)
-    add_url = State()       # To'liq URL (YouTube/Instagram uchun)
-    remove = State()        # O'chirish uchun username
-
+    add_username = State()
+    add_title    = State()
+    remove       = State()
 
 class BroadcastForm(StatesGroup):
     waiting = State()
     confirm = State()
 
+class SupportForm(StatesGroup):
+    add    = State()
+    remove = State()
 
-# ──────────────────────────────────────────────────────────────
-# ROUTERLAR  (ikkita alohida router — admin va user)
-# BU JUDA MUHIM: admin routeri dp ga birinchi qo'shiladi,
-# shunda admin FSM state lari user handlerlaridan oldin ishlaydi
-# ──────────────────────────────────────────────────────────────
+class UserSearchForm(StatesGroup):
+    waiting = State()
 
-admin_router = Router()   # Faqat admin
-user_router  = Router()   # Umumiy + foydalanuvchi
+class UserBalanceForm(StatesGroup):
+    waiting = State()
 
-# ══════════════════════════════════════════════════════════════
-# UMUMIY HANDLERLAR — /start, /help, obuna (user_router)
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# ROUTERLAR
+# ═══════════════════════════════════════════════════════════════
+admin_router = Router()
+user_router  = Router()
+
+
+# ═══════════════════════════════════════════════════════════════
+# /start — REFERAL TIZIMI BILAN
+# ═══════════════════════════════════════════════════════════════
 
 @user_router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot) -> None:
     try:
-        if message.from_user.id == ADMIN_ID:
+        user = message.from_user
+        args = message.text.split()
+        referrer_id: int | None = None
+
+        # /start ref_12345678 formatini tekshirish
+        if len(args) > 1 and args[1].startswith("ref_"):
+            try:
+                ref_id = int(args[1][4:])
+                if ref_id != user.id:
+                    referrer_id = ref_id
+            except ValueError:
+                pass
+
+        # Yangi foydalanuvchimi?
+        is_new = await db_add_or_update_user(
+            user_id=user.id,
+            username=user.username,
+            full_name=user.full_name or str(user.id),
+            referrer_id=referrer_id,
+        )
+
+        # Referal bonusini berish — faqat yangi foydalanuvchi uchun
+        if is_new and referrer_id:
+            ref_user = await db_get_user(referrer_id)
+            if ref_user:
+                await db_add_referral_bonus(referrer_id, REFERRAL_BONUS)
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 <b>{user.full_name}</b> sizning havolangiz orqali botga qo'shildi!\n"
+                        f"💰 Hisobingizga <b>{REFERRAL_BONUS} so'm</b> qo'shildi.",
+                    )
+                except Exception:
+                    pass
+
+        if user.id == ADMIN_ID:
             await message.answer(
                 "👋 Xush kelibsiz, <b>Admin</b>!\nBot boshqaruvi paneliga xush kelibsiz.",
                 reply_markup=kb_admin_main(),
             )
         else:
-            await message.answer(
-                f"👋 Salom, <b>{message.from_user.full_name}</b>!\n\n"
+            txt = (
+                f"👋 Salom, <b>{user.full_name}</b>!\n\n"
                 "🎬 Kino kodini yozing — men kinoni yuboraman.\n"
-                "Masalan: <code>125</code>",
-                reply_markup=kb_main_user(),
+                "Masalan: <code>125</code>"
             )
+            if is_new and referrer_id:
+                txt += f"\n\n🎁 Siz taklif orqali keldingiz!"
+            await message.answer(txt, reply_markup=kb_main_user())
     except Exception as exc:
         logger.error("cmd_start: %s", exc, exc_info=True)
 
 
-@user_router.message(Command("help"))
-@user_router.message(F.text == "ℹ️ Yordam")
-async def cmd_help(message: Message, bot: Bot) -> None:
+# ═══════════════════════════════════════════════════════════════
+# FOYDALANUVCHI — Profil, Referal, Reyting, Yordam
+# ═══════════════════════════════════════════════════════════════
+
+@user_router.message(F.text == "👤 Profilim")
+async def user_profile(message: Message) -> None:
     try:
+        u = await db_get_user(message.from_user.id)
+        if not u:
+            await message.answer("❌ Profil topilmadi.")
+            return
+        today_refs  = await db_get_user_refs_today(u["user_id"])
+        week_refs   = await db_get_user_refs_period(u["user_id"], 7)
+        month_refs  = await db_get_user_refs_period(u["user_id"], 30)
+        uname = f"@{u['username']}" if u.get("username") else "—"
+        supports = await db_get_supports()
+        support_line = ""
+        if supports:
+            support_line = "\n\n💬 <b>Yordam uchun:</b> @" + supports[0]
+
+        text = (
+            f"👤 <b>Profil</b>\n\n"
+            f"🆔 ID: <code>{u['user_id']}</code>\n"
+            f"👤 Ism: {u['full_name']}\n"
+            f"📲 Username: {uname}\n\n"
+            f"💰 Balans: <b>{u.get('balance', 0)} so'm</b>\n"
+            f"👥 Jami referallar: <b>{u.get('ref_count', 0)}</b>\n"
+            f"  📅 Bugun: {today_refs}\n"
+            f"  🗓 1 hafta: {week_refs}\n"
+            f"  📆 1 oy: {month_refs}"
+            f"{support_line}"
+        )
+        await message.answer(text)
+    except Exception as exc:
+        logger.error("user_profile: %s", exc, exc_info=True)
+
+
+@user_router.message(F.text == "🔗 Referal Havola")
+async def user_referral(message: Message, bot: Bot) -> None:
+    try:
+        bot_info = await bot.get_me()
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{message.from_user.id}"
+        u = await db_get_user(message.from_user.id)
+        balance  = u.get("balance", 0) if u else 0
+        ref_count = u.get("ref_count", 0) if u else 0
+
+        text = (
+            f"🔗 <b>Sizning referal havolangiz:</b>\n\n"
+            f"<code>{ref_link}</code>\n\n"
+            f"👥 Taklif qilganlaring: <b>{ref_count}</b>\n"
+            f"💰 Balans: <b>{balance} so'm</b>\n\n"
+            f"💡 Har bir yangi foydalanuvchi uchun <b>{REFERRAL_BONUS} so'm</b> olasiz!\n"
+            f"💳 Pulni olish uchun yordamchi adminga murojaat qiling."
+        )
+        await message.answer(text)
+    except Exception as exc:
+        logger.error("user_referral: %s", exc, exc_info=True)
+
+
+@user_router.message(F.text == "🏆 Reyting")
+async def user_rating(message: Message) -> None:
+    try:
+        top = await db_get_top_referrers(10)
+        lines = ["🏆 <b>Referal Reytingi (Top-10)</b>\n"]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, u in enumerate(top, 1):
+            medal = medals[i-1] if i <= 3 else f"{i}."
+            uname = f"@{u['username']}" if u.get("username") else u["full_name"]
+            lines.append(f"{medal} {uname} — <b>{u['ref_count']}</b> ta referal")
+
+        if not top:
+            lines.append("Hali hech kim referal qilmagan.")
+
+        # Foydalanuvchining o'z o'rni
+        all_top = await db_get_top_referrers(1000)
+        my_rank = next(
+            (i for i, u in enumerate(all_top, 1) if u["user_id"] == message.from_user.id),
+            None
+        )
+        if my_rank:
+            lines.append(f"\n📍 Sizning o'rningiz: <b>{my_rank}</b>-o'rin")
+
+        await message.answer("\n".join(lines))
+    except Exception as exc:
+        logger.error("user_rating: %s", exc, exc_info=True)
+
+
+@user_router.message(F.text == "ℹ️ Yordam")
+async def cmd_help(message: Message) -> None:
+    try:
+        supports = await db_get_supports()
+        support_line = ""
+        if supports:
+            links = " | ".join(f"@{s}" for s in supports)
+            support_line = f"\n\n💬 <b>Yordam uchun:</b> {links}"
         await message.answer(
             "ℹ️ <b>Yordam</b>\n\n"
             "🎬 Kino kodini yozing — bot kinoni yuboradi.\n"
             "Masalan: <code>125</code>\n\n"
-            "❓ Muammolar bo'lsa admin bilan bog'laning.",
+            "🔗 Referal havolangizni do'stlaringizga yuboring\n"
+            "💰 Har bir yangi foydalanuvchi uchun bonus oling"
+            f"{support_line}",
         )
     except Exception as exc:
         logger.error("cmd_help: %s", exc, exc_info=True)
 
 
+# ═══════════════════════════════════════════════════════════════
+# OBUNA TEKSHIRISH (callback)
+# ═══════════════════════════════════════════════════════════════
+
 @user_router.callback_query(F.data == "check_sub")
 async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
-    """'Tekshirish' tugmasi — Telegram kanallarni tekshiradi."""
     try:
         channels = await db_get_channels()
         if not channels:
@@ -661,7 +901,7 @@ async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
             except Exception:
                 pass
             await call.message.answer(
-                f"👋 Salom, <b>{call.from_user.full_name}</b>!\n"
+                f"✅ Botdan foydalanishingiz mumkin!\n"
                 "🎬 Kino kodini yozing. Masalan: <code>125</code>",
                 reply_markup=kb_main_user(),
             )
@@ -669,10 +909,6 @@ async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
 
         not_subbed: list[dict] = []
         for ch in channels:
-            ch_type = ch.get("channel_type", "telegram")
-            if ch_type != "telegram":
-                # Instagram/YouTube tekshirib bo'lmaydi — o'tkazib yuboramiz
-                continue
             try:
                 member = await bot.get_chat_member(
                     chat_id=ch["channel_username"], user_id=call.from_user.id
@@ -680,21 +916,14 @@ async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
                 if member.status in ("left", "kicked"):
                     not_subbed.append(ch)
             except TelegramForbiddenError:
-                logger.warning("Bot %s kanalda admin emas.", ch["channel_username"])
-            except TelegramBadRequest as exc:
-                logger.warning("check_sub_cb (%s): %s", ch["channel_username"], exc)
+                logger.warning("Bot %s da admin emas.", ch["channel_username"])
             except Exception as exc:
                 logger.error("check_sub_cb (%s): %s", ch["channel_username"], exc)
 
         if not_subbed:
-            await call.answer(
-                "❌ Hali barcha Telegram kanallarga obuna bo'lmagansiz!",
-                show_alert=True,
-            )
+            await call.answer("❌ Hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True)
             try:
-                await call.message.edit_reply_markup(
-                    reply_markup=_build_subscribe_kb(not_subbed)
-                )
+                await call.message.edit_reply_markup(reply_markup=kb_subscribe(not_subbed))
             except Exception:
                 pass
         else:
@@ -711,13 +940,11 @@ async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
             )
     except Exception as exc:
         logger.error("check_sub_cb: %s", exc, exc_info=True)
-        await call.answer("❌ Xatolik yuz berdi.", show_alert=True)
+        await call.answer("❌ Xatolik.", show_alert=True)
 
-# ══════════════════════════════════════════════════════════════
-# FOYDALANUVCHI — kino qidirish (user_router)
-# MUHIM: StateFilter(None) — faqat holatsiz (hech qanday FSM
-# state yo'q) holatda ishlaydi. Shu bilan admin FSM ni buzmaydi.
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# FOYDALANUVCHI — kino qidirish
+# ═══════════════════════════════════════════════════════════════
 
 @user_router.message(F.text == "🎬 Kino Qidirish")
 async def ask_movie_code(message: Message) -> None:
@@ -730,12 +957,8 @@ async def ask_movie_code(message: Message) -> None:
         logger.error("ask_movie_code: %s", exc, exc_info=True)
 
 
-@user_router.message(
-    F.text.regexp(r"^\d+$"),
-    StateFilter(None),       # ← faqat hech qanday FSM state yo'qda ishlaydi
-)
+@user_router.message(F.text.regexp(r"^\d+$"), StateFilter(None))
 async def search_movie(message: Message, bot: Bot) -> None:
-    """Foydalanuvchi raqam (kino kodi) yuborganda kinoni topib yuboradi."""
     if message.from_user.id == ADMIN_ID:
         return
     try:
@@ -744,10 +967,9 @@ async def search_movie(message: Message, bot: Bot) -> None:
         if not movie:
             await message.answer(
                 f"❌ <b>{kino_kod}</b> kodli kino topilmadi.\n"
-                "Kino kodini to'g'ri kiritdingizmi?"
+                "Kodini to'g'ri kiritdingizmi?"
             )
             return
-
         await db_increment_views(kino_kod)
         caption = (
             f"🎬 <b>{movie['kino_nomi']}</b>\n\n"
@@ -755,26 +977,25 @@ async def search_movie(message: Message, bot: Bot) -> None:
             f"🔑 Kod: <code>{movie['kino_kod']}</code>\n"
             f"👁 Ko'rishlar: <b>{movie['views_count'] + 1}</b>"
         )
-        await bot.send_video(
-            chat_id=message.chat.id,
-            video=movie["file_id"],
-            caption=caption,
-        )
+        await bot.send_video(chat_id=message.chat.id, video=movie["file_id"], caption=caption)
     except Exception as exc:
         logger.error("search_movie: %s", exc, exc_info=True)
-        await message.answer("❌ Xatolik yuz berdi. Qayta urinib ko'ring.")
+        await message.answer("❌ Xatolik. Qayta urinib ko'ring.")
 
-# ══════════════════════════════════════════════════════════════
-# ADMIN — statistika (admin_router)
-# ══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — Statistika
+# ═══════════════════════════════════════════════════════════════
 
 async def _send_stat(target: Message | CallbackQuery) -> None:
     try:
         total  = await db_get_users_count()
         today  = await db_get_today_count()
         online = await db_get_online_count()
+        week   = await db_get_period_count(7)
+        month  = await db_get_period_count(30)
         top    = await db_get_top_movies(10)
-        text   = build_stat_text(total, today, online, top)
+        text   = build_stat_text(total, today, online, week, month, top)
         if isinstance(target, Message):
             await target.answer(text, reply_markup=kb_stat())
         else:
@@ -816,16 +1037,236 @@ async def download_users(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("❌ Xatolik.", show_alert=True)
 
 
-# ══════════════════════════════════════════════════════════════
-# ADMIN — kanallar boshqaruvi (admin_router, FSM)
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — Reyting (to'liq)
+# ═══════════════════════════════════════════════════════════════
 
-@admin_router.message(IsAdmin(), F.text == "⚙️ Kanallar Boshqaruvi")
+@admin_router.message(IsAdmin(), F.text == "🏆 Reyting")
+async def admin_rating(message: Message) -> None:
+    try:
+        top = await db_get_top_referrers(20)
+        lines = ["🏆 <b>Referal Reytingi (Top-20)</b>\n"]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, u in enumerate(top, 1):
+            medal = medals[i-1] if i <= 3 else f"{i}."
+            uname = f"@{u['username']}" if u.get("username") else "—"
+            lines.append(
+                f"{medal} {u['full_name']} ({uname})\n"
+                f"   👥 {u['ref_count']} referal | 💰 {u.get('balance',0)} so'm"
+            )
+        if not top:
+            lines.append("Hali hech kim referal qilmagan.")
+
+        # Referal statistikasi
+        total_today = await db_get_today_count()
+        total_week  = await db_get_period_count(7)
+        total_month = await db_get_period_count(30)
+        lines.append(
+            f"\n📈 <b>Jami yangi foydalanuvchilar:</b>\n"
+            f"  Bugun: {total_today} | Hafta: {total_week} | Oy: {total_month}"
+        )
+        await message.answer("\n".join(lines))
+    except Exception as exc:
+        logger.error("admin_rating: %s", exc, exc_info=True)
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — Foydalanuvchilar boshqaruvi
+# ═══════════════════════════════════════════════════════════════
+
+@admin_router.message(IsAdmin(), F.text == "👥 Foydalanuvchilar")
+async def admin_users_menu(message: Message) -> None:
+    try:
+        total = await db_get_users_count()
+        await message.answer(
+            f"👥 <b>Foydalanuvchilar boshqaruvi</b>\n\nJami: <b>{total}</b> ta",
+            reply_markup=kb_admin_users(),
+        )
+    except Exception as exc:
+        logger.error("admin_users_menu: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), F.text == "🔍 Foydalanuvchi Izlash")
+async def user_search_start(message: Message, state: FSMContext) -> None:
+    try:
+        await state.set_state(UserSearchForm.waiting)
+        await message.answer(
+            "🔍 Foydalanuvchi ID si yoki @username ni yuboring:",
+            reply_markup=kb_cancel(),
+        )
+    except Exception as exc:
+        logger.error("user_search_start: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), StateFilter(UserSearchForm.waiting))
+async def user_search_done(message: Message, state: FSMContext) -> None:
+    try:
+        if message.text == "❌ Bekor Qilish":
+            await state.clear()
+            await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_users())
+            return
+
+        query = (message.text or "").strip().lstrip("@")
+        await state.clear()
+
+        user_data: dict | None = None
+        # ID orqali qidirish
+        if query.isdigit():
+            user_data = await db_get_user(int(query))
+        # Username orqali qidirish
+        if not user_data:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (query,)
+                )
+                row = await cur.fetchone()
+                if row:
+                    user_data = dict(row)
+
+        if not user_data:
+            await message.answer("❌ Foydalanuvchi topilmadi.", reply_markup=kb_admin_users())
+            return
+
+        uid    = user_data["user_id"]
+        uname  = f"@{user_data['username']}" if user_data.get("username") else "—"
+        today_r = await db_get_user_refs_today(uid)
+        week_r  = await db_get_user_refs_period(uid, 7)
+        month_r = await db_get_user_refs_period(uid, 30)
+
+        text = (
+            f"👤 <b>Foydalanuvchi ma'lumotlari</b>\n\n"
+            f"🆔 ID: <code>{uid}</code>\n"
+            f"👤 Ism: {user_data['full_name']}\n"
+            f"📲 Username: {uname}\n"
+            f"📅 Qo'shilgan: {user_data['join_date'][:10]}\n\n"
+            f"💰 Balans: <b>{user_data.get('balance', 0)} so'm</b>\n"
+            f"👥 Jami referallar: <b>{user_data.get('ref_count', 0)}</b>\n"
+            f"  Bugun: {today_r} | Hafta: {week_r} | Oy: {month_r}"
+        )
+        await message.answer(text, reply_markup=kb_user_manage(uid))
+    except Exception as exc:
+        logger.error("user_search_done: %s", exc, exc_info=True)
+        await state.clear()
+        await message.answer("❌ Xatolik.", reply_markup=kb_admin_users())
+
+
+@admin_router.callback_query(IsAdmin(), F.data.startswith("ubal_"))
+async def user_balance_start(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        uid = int(call.data.split("_")[1])
+        await state.update_data(target_uid=uid)
+        await state.set_state(UserBalanceForm.waiting)
+        await call.message.answer(
+            f"💰 Foydalanuvchi <code>{uid}</code> uchun yangi balans miqdorini kiriting\n"
+            "(Musbat qo'shadi, manfiy ayiradi. Masalan: <code>500</code> yoki <code>-200</code>):",
+            reply_markup=kb_cancel(),
+        )
+        await call.answer()
+    except Exception as exc:
+        logger.error("user_balance_start: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), StateFilter(UserBalanceForm.waiting))
+async def user_balance_done(message: Message, state: FSMContext) -> None:
+    try:
+        if message.text == "❌ Bekor Qilish":
+            await state.clear()
+            await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_main())
+            return
+
+        text = (message.text or "").strip()
+        if not text.lstrip("-").isdigit():
+            await message.answer("❌ Faqat raqam kiriting (masalan: 500 yoki -200):")
+            return
+
+        data = await state.get_data()
+        uid  = data["target_uid"]
+        amount = int(text)
+        new_bal = await db_update_balance(uid, amount)
+        await state.clear()
+
+        sign = "+" if amount >= 0 else ""
+        await message.answer(
+            f"✅ Foydalanuvchi <code>{uid}</code> balansi yangilandi!\n"
+            f"O'zgarish: {sign}{amount} so'm\n"
+            f"Yangi balans: <b>{new_bal} so'm</b>",
+            reply_markup=kb_admin_main(),
+        )
+        # Foydalanuvchiga xabar berish
+        try:
+            await message.bot.send_message(
+                uid,
+                f"💰 Sizning balansingiz yangilandi!\n"
+                f"O'zgarish: {sign}{amount} so'm\n"
+                f"Yangi balans: <b>{new_bal} so'm</b>",
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("user_balance_done: %s", exc, exc_info=True)
+        await state.clear()
+        await message.answer("❌ Xatolik.", reply_markup=kb_admin_main())
+
+
+@admin_router.callback_query(IsAdmin(), F.data.startswith("uzero_"))
+async def user_balance_zero(call: CallbackQuery) -> None:
+    try:
+        uid = int(call.data.split("_")[1])
+        await db_set_balance(uid, 0)
+        await call.answer("✅ Balans nolga tushirildi.", show_alert=True)
+        try:
+            await call.bot.send_message(
+                uid,
+                "ℹ️ Sizning balansingiz 0 ga tushirildi.",
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("user_balance_zero: %s", exc, exc_info=True)
+        await call.answer("❌ Xatolik.", show_alert=True)
+
+
+@admin_router.callback_query(IsAdmin(), F.data.startswith("uref_"))
+async def user_ref_stat(call: CallbackQuery) -> None:
+    try:
+        uid = int(call.data.split("_")[1])
+        today = await db_get_user_refs_today(uid)
+        week  = await db_get_user_refs_period(uid, 7)
+        month = await db_get_user_refs_period(uid, 30)
+        u     = await db_get_user(uid)
+        total_ref = u.get("ref_count", 0) if u else 0
+        await call.answer(
+            f"👥 Referallar:\nBugun: {today}\n1 hafta: {week}\n1 oy: {month}\nJami: {total_ref}",
+            show_alert=True,
+        )
+    except Exception as exc:
+        logger.error("user_ref_stat: %s", exc, exc_info=True)
+        await call.answer("❌ Xatolik.", show_alert=True)
+
+
+@admin_router.message(IsAdmin(), F.text == "📥 Ro'yxat (TXT)")
+async def download_users_menu(message: Message, bot: Bot) -> None:
+    try:
+        users   = await db_get_all_users()
+        content = build_users_txt(users)
+        file    = BufferedInputFile(content, filename="foydalanuvchilar.txt")
+        await bot.send_document(
+            chat_id=message.chat.id,
+            document=file,
+            caption=f"📥 Jami <b>{len(users)}</b> ta foydalanuvchi.",
+        )
+    except Exception as exc:
+        logger.error("download_users_menu: %s", exc, exc_info=True)
+        await message.answer("❌ Xatolik.")
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — Kanallar boshqaruvi
+# ═══════════════════════════════════════════════════════════════
+
+@admin_router.message(IsAdmin(), F.text == "⚙️ Kanallar")
 async def channels_menu(message: Message) -> None:
     try:
-        await message.answer(
-            "⚙️ <b>Kanallar Boshqaruvi</b>", reply_markup=kb_admin_channels()
-        )
+        await message.answer("⚙️ <b>Kanallar Boshqaruvi</b>", reply_markup=kb_admin_channels())
     except Exception as exc:
         logger.error("channels_menu: %s", exc, exc_info=True)
 
@@ -842,84 +1283,17 @@ async def back_to_main(message: Message, state: FSMContext) -> None:
 @admin_router.message(IsAdmin(), F.text == "➕ Kanal Qo'shish")
 async def channel_add_start(message: Message, state: FSMContext) -> None:
     try:
-        await state.set_state(ChannelForm.choose_type)
+        await state.set_state(ChannelForm.add_username)
         await message.answer(
             "➕ <b>Kanal qo'shish</b>\n\n"
-            "Qo'shmoqchi bo'lgan kanalning turini tanlang:",
-            reply_markup=kb_channel_type(),
+            "Kanal username'ini yuboring:\n\n"
+            "✅ To'g'ri: <code>@majburiykanal</code>\n"
+            "✅ To'g'ri: <code>majburiykanal</code>\n\n"
+            "⚠️ Bot o'sha kanalda <b>admin</b> bo'lishi shart!",
+            reply_markup=kb_cancel(),
         )
     except Exception as exc:
         logger.error("channel_add_start: %s", exc, exc_info=True)
-
-
-@admin_router.callback_query(IsAdmin(), F.data.startswith("chtype_"), StateFilter(ChannelForm.choose_type))
-async def channel_choose_type(call: CallbackQuery, state: FSMContext) -> None:
-    try:
-        ch_type_raw = call.data.replace("chtype_", "")
-
-        if ch_type_raw == "cancel":
-            await state.clear()
-            await call.message.edit_text("❌ Bekor qilindi.")
-            await call.message.answer("🏠 Kanallar menyusi", reply_markup=kb_admin_channels())
-            return
-
-        # Telegram kanal/guruh/bot uchun bir xil tip
-        ch_type = ch_type_raw  # 'telegram', 'instagram', 'youtube'
-
-        await state.update_data(ch_type=ch_type)
-        await state.set_state(ChannelForm.add_title)
-        await call.message.edit_text(
-            f"✏️ <b>Sarlavha</b> kiriting\n"
-            f"(Tugmalarda ko'rinadigan nom, masalan: <code>Rasmiy kanal</code>):"
-        )
-    except Exception as exc:
-        logger.error("channel_choose_type: %s", exc, exc_info=True)
-        await call.answer("❌ Xatolik.", show_alert=True)
-
-
-@admin_router.message(IsAdmin(), StateFilter(ChannelForm.add_title))
-async def channel_add_title(message: Message, state: FSMContext) -> None:
-    try:
-        if message.text == "❌ Bekor Qilish":
-            await state.clear()
-            await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_channels())
-            return
-
-        title = (message.text or "").strip()
-        if not title:
-            await message.answer("❌ Sarlavha bo'sh bo'lmasin. Qayta yuboring:")
-            return
-
-        data = await state.get_data()
-        ch_type = data["ch_type"]
-        await state.update_data(ch_title=title)
-        await state.set_state(ChannelForm.add_username)
-
-        if ch_type == "telegram":
-            await message.answer(
-                "📢 <b>Telegram username</b> kiriting:\n\n"
-                "✅ To'g'ri: <code>@majburiykanal</code>\n"
-                "✅ To'g'ri: <code>majburiykanal</code>\n\n"
-                "⚠️ Bot o'sha kanalda <b>admin</b> bo'lishi shart!",
-                reply_markup=kb_cancel(),
-            )
-        elif ch_type == "instagram":
-            await message.answer(
-                "📸 <b>Instagram username</b> kiriting:\n\n"
-                "✅ To'g'ri: <code>@username</code>\n"
-                "✅ To'g'ri: <code>username</code>\n"
-                "✅ To'g'ri: <code>https://instagram.com/username</code>",
-                reply_markup=kb_cancel(),
-            )
-        elif ch_type == "youtube":
-            await message.answer(
-                "▶️ <b>YouTube kanal havolasini</b> kiriting:\n\n"
-                "✅ To'g'ri: <code>https://youtube.com/@kanal</code>\n"
-                "✅ To'g'ri: <code>@kanal</code>",
-                reply_markup=kb_cancel(),
-            )
-    except Exception as exc:
-        logger.error("channel_add_title: %s", exc, exc_info=True)
 
 
 @admin_router.message(IsAdmin(), StateFilter(ChannelForm.add_username))
@@ -929,102 +1303,53 @@ async def channel_add_username(message: Message, state: FSMContext) -> None:
             await state.clear()
             await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_channels())
             return
-
         raw = (message.text or "").strip()
-        if not raw:
-            await message.answer("❌ Bo'sh bo'lmasin. Qayta yuboring:")
+        uname = _norm_ch(raw)
+        if not uname:
+            await message.answer(
+                "❌ Noto'g'ri format. Masalan: <code>@majburiykanal</code>"
+            )
             return
-
-        data = await state.get_data()
-        ch_type = data["ch_type"]
-        title = data["ch_title"]
-
-        if ch_type == "telegram":
-            username = _norm_ch(raw)
-            if not username:
-                await message.answer(
-                    "❌ Noto'g'ri format. Masalan: <code>@majburiykanal</code>"
-                )
-                return
-            url = f"https://t.me/{username.lstrip('@')}"
-            success = await db_add_channel(username, ch_type, url, title)
-            await state.clear()
-            if success:
-                await message.answer(
-                    f"✅ Telegram kanal qo'shildi!\n\n"
-                    f"📢 Sarlavha: <b>{title}</b>\n"
-                    f"🔗 Username: <code>{username}</code>\n\n"
-                    f"⚠️ Eslatma: Bot <b>{username}</b> kanalida <b>admin</b> bo'lishi shart!",
-                    reply_markup=kb_admin_channels(),
-                )
-            else:
-                await message.answer(
-                    f"⚠️ <b>{username}</b> allaqachon ro'yxatda mavjud.",
-                    reply_markup=kb_admin_channels(),
-                )
-
-        elif ch_type == "instagram":
-            # Instagram URL ni normallashtirish
-            username_clean = raw
-            for prefix in ("https://instagram.com/", "https://www.instagram.com/",
-                           "instagram.com/", "www.instagram.com/"):
-                if username_clean.lower().startswith(prefix):
-                    username_clean = username_clean[len(prefix):]
-                    break
-            username_clean = username_clean.lstrip("@").rstrip("/").strip()
-            if not username_clean:
-                await message.answer("❌ Noto'g'ri format. Qayta yuboring:")
-                return
-            url = f"https://instagram.com/{username_clean}"
-            db_key = f"ig_{username_clean}"
-            success = await db_add_channel(db_key, ch_type, url, title)
-            await state.clear()
-            if success:
-                await message.answer(
-                    f"✅ Instagram qo'shildi!\n\n"
-                    f"📸 Sarlavha: <b>{title}</b>\n"
-                    f"🔗 Havola: {url}\n\n"
-                    f"ℹ️ Instagram obunasi foydalanuvchi tomonidan tasdiqlanadi.",
-                    reply_markup=kb_admin_channels(),
-                )
-            else:
-                await message.answer(
-                    f"⚠️ Bu Instagram allaqachon ro'yxatda.",
-                    reply_markup=kb_admin_channels(),
-                )
-
-        elif ch_type == "youtube":
-            # YouTube URL ni normallashtirish
-            raw_yt = raw
-            for prefix in ("https://youtube.com/", "https://www.youtube.com/",
-                           "youtube.com/", "www.youtube.com/"):
-                if raw_yt.lower().startswith(prefix):
-                    raw_yt = raw_yt[len(prefix):]
-                    break
-            raw_yt = raw_yt.lstrip("@").rstrip("/").strip()
-            if not raw_yt:
-                await message.answer("❌ Noto'g'ri format. Qayta yuboring:")
-                return
-            url = f"https://youtube.com/@{raw_yt}"
-            db_key = f"yt_{raw_yt}"
-            success = await db_add_channel(db_key, ch_type, url, title)
-            await state.clear()
-            if success:
-                await message.answer(
-                    f"✅ YouTube qo'shildi!\n\n"
-                    f"▶️ Sarlavha: <b>{title}</b>\n"
-                    f"🔗 Havola: {url}\n\n"
-                    f"ℹ️ YouTube obunasi foydalanuvchi tomonidan tasdiqlanadi.",
-                    reply_markup=kb_admin_channels(),
-                )
-            else:
-                await message.answer(
-                    f"⚠️ Bu YouTube allaqachon ro'yxatda.",
-                    reply_markup=kb_admin_channels(),
-                )
-
+        await state.update_data(ch_username=uname)
+        await state.set_state(ChannelForm.add_title)
+        await message.answer(
+            "✏️ Kanal sarlavhasini kiriting\n(Tugmada ko'rinadigan nom):",
+            reply_markup=kb_cancel(),
+        )
     except Exception as exc:
         logger.error("channel_add_username: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), StateFilter(ChannelForm.add_title))
+async def channel_add_title(message: Message, state: FSMContext) -> None:
+    try:
+        if message.text == "❌ Bekor Qilish":
+            await state.clear()
+            await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_channels())
+            return
+        title = (message.text or "").strip()
+        if not title:
+            await message.answer("❌ Sarlavha bo'sh bo'lmasin:")
+            return
+        data = await state.get_data()
+        uname = data["ch_username"]
+        success = await db_add_channel(uname, title)
+        await state.clear()
+        if success:
+            await message.answer(
+                f"✅ Kanal qo'shildi!\n\n"
+                f"📢 Sarlavha: <b>{title}</b>\n"
+                f"🔗 Username: <code>{uname}</code>\n\n"
+                f"⚠️ Bot {uname} kanalida <b>admin</b> bo'lishi shart!",
+                reply_markup=kb_admin_channels(),
+            )
+        else:
+            await message.answer(
+                f"⚠️ <b>{uname}</b> allaqachon ro'yxatda.",
+                reply_markup=kb_admin_channels(),
+            )
+    except Exception as exc:
+        logger.error("channel_add_title: %s", exc, exc_info=True)
         await state.clear()
         await message.answer("❌ Xatolik.", reply_markup=kb_admin_channels())
 
@@ -1036,17 +1361,12 @@ async def channel_remove_start(message: Message, state: FSMContext) -> None:
         if not channels:
             await message.answer("📭 Ro'yxat bo'sh.", reply_markup=kb_admin_channels())
             return
-
-        type_icons = {"telegram": "📢", "instagram": "📸", "youtube": "▶️"}
-        lines = []
+        lines = ["➖ <b>O'chirish uchun username'ni yuboring:</b>\n"]
         for i, ch in enumerate(channels, 1):
-            icon = type_icons.get(ch.get("channel_type", "telegram"), "🔗")
             title = ch.get("channel_title") or ch["channel_username"]
-            lines.append(f"{i}. {icon} {title} — <code>{ch['channel_username']}</code>")
-
-        text = "➖ <b>O'chirish uchun username'ini yuboring:</b>\n\n" + "\n".join(lines)
+            lines.append(f"{i}. {title} — <code>{ch['channel_username']}</code>")
         await state.set_state(ChannelForm.remove)
-        await message.answer(text, reply_markup=kb_cancel())
+        await message.answer("\n".join(lines), reply_markup=kb_cancel())
     except Exception as exc:
         logger.error("channel_remove_start: %s", exc, exc_info=True)
 
@@ -1068,7 +1388,7 @@ async def channel_remove_done(message: Message, state: FSMContext) -> None:
             )
         else:
             await message.answer(
-                f"❌ <b>{username}</b> topilmadi. To'liq username'ni yuboring.",
+                f"❌ <b>{username}</b> topilmadi.",
                 reply_markup=kb_admin_channels(),
             )
     except Exception as exc:
@@ -1082,32 +1402,132 @@ async def list_channels(message: Message) -> None:
     try:
         channels = await db_get_channels()
         if not channels:
-            await message.answer(
-                "📭 Hali hech qanday kanal yo'q.", reply_markup=kb_admin_channels()
-            )
+            await message.answer("📭 Hali kanal yo'q.", reply_markup=kb_admin_channels())
             return
-
-        type_icons = {"telegram": "📢", "instagram": "📸", "youtube": "▶️"}
-        type_names = {"telegram": "Telegram", "instagram": "Instagram", "youtube": "YouTube"}
-        lines = ["📋 <b>Majburiy Obuna Ro'yxati:</b>\n"]
+        lines = ["📋 <b>Majburiy Kanallar:</b>\n"]
         for i, ch in enumerate(channels, 1):
-            ch_type = ch.get("channel_type", "telegram")
-            icon = type_icons.get(ch_type, "🔗")
-            type_name = type_names.get(ch_type, "Boshqa")
             title = ch.get("channel_title") or ch["channel_username"]
-            url = ch.get("channel_url") or ""
-            lines.append(
-                f"{i}. {icon} <b>{title}</b> [{type_name}]\n"
-                f"   📌 <code>{ch['channel_username']}</code>"
-            )
-
+            lines.append(f"{i}. <b>{title}</b>\n   <code>{ch['channel_username']}</code>")
         await message.answer("\n".join(lines), reply_markup=kb_admin_channels())
     except Exception as exc:
         logger.error("list_channels: %s", exc, exc_info=True)
 
-# ══════════════════════════════════════════════════════════════
-# ADMIN — kino qo'shish / o'chirish (admin_router, FSM)
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — Yordamchi adminlar boshqaruvi
+# ═══════════════════════════════════════════════════════════════
+
+@admin_router.message(IsAdmin(), F.text == "🛠 Yordamchi Adminlar")
+async def support_menu(message: Message) -> None:
+    try:
+        await message.answer(
+            "🛠 <b>Yordamchi Adminlar Boshqaruvi</b>\n\n"
+            "Foydalanuvchilar 'Yordam' va 'Bog'lanish' uchun shu username larni ko'radi.",
+            reply_markup=kb_admin_support(),
+        )
+    except Exception as exc:
+        logger.error("support_menu: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), F.text == "➕ Admin Qo'shish")
+async def support_add_start(message: Message, state: FSMContext) -> None:
+    try:
+        await state.set_state(SupportForm.add)
+        await message.answer(
+            "➕ Yordamchi admin username'ini yuboring:\n"
+            "Masalan: <code>@username</code> yoki <code>username</code>",
+            reply_markup=kb_cancel(),
+        )
+    except Exception as exc:
+        logger.error("support_add_start: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), StateFilter(SupportForm.add))
+async def support_add_done(message: Message, state: FSMContext) -> None:
+    try:
+        if message.text == "❌ Bekor Qilish":
+            await state.clear()
+            await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_support())
+            return
+        username = (message.text or "").strip().lstrip("@")
+        if not username:
+            await message.answer("❌ Username bo'sh bo'lmasin.")
+            return
+        success = await db_add_support(username)
+        await state.clear()
+        if success:
+            await message.answer(
+                f"✅ @{username} yordamchi adminlarga qo'shildi.\n"
+                f"Foydalanuvchilar endi @{username} ga murojaat qiladi.",
+                reply_markup=kb_admin_support(),
+            )
+        else:
+            await message.answer(
+                f"⚠️ @{username} allaqachon ro'yxatda.",
+                reply_markup=kb_admin_support(),
+            )
+    except Exception as exc:
+        logger.error("support_add_done: %s", exc, exc_info=True)
+        await state.clear()
+        await message.answer("❌ Xatolik.", reply_markup=kb_admin_support())
+
+
+@admin_router.message(IsAdmin(), F.text == "➖ Admin O'chirish")
+async def support_remove_start(message: Message, state: FSMContext) -> None:
+    try:
+        supports = await db_get_supports()
+        if not supports:
+            await message.answer("📭 Ro'yxat bo'sh.", reply_markup=kb_admin_support())
+            return
+        text = "➖ O'chirish uchun username'ni yuboring:\n\n"
+        text += "\n".join(f"{i}. @{s}" for i, s in enumerate(supports, 1))
+        await state.set_state(SupportForm.remove)
+        await message.answer(text, reply_markup=kb_cancel())
+    except Exception as exc:
+        logger.error("support_remove_start: %s", exc, exc_info=True)
+
+
+@admin_router.message(IsAdmin(), StateFilter(SupportForm.remove))
+async def support_remove_done(message: Message, state: FSMContext) -> None:
+    try:
+        if message.text == "❌ Bekor Qilish":
+            await state.clear()
+            await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_support())
+            return
+        username = (message.text or "").strip().lstrip("@")
+        deleted  = await db_remove_support(username)
+        await state.clear()
+        if deleted:
+            await message.answer(
+                f"✅ @{username} ro'yxatdan o'chirildi.",
+                reply_markup=kb_admin_support(),
+            )
+        else:
+            await message.answer(
+                f"❌ @{username} topilmadi.",
+                reply_markup=kb_admin_support(),
+            )
+    except Exception as exc:
+        logger.error("support_remove_done: %s", exc, exc_info=True)
+        await state.clear()
+        await message.answer("❌ Xatolik.", reply_markup=kb_admin_support())
+
+
+@admin_router.message(IsAdmin(), F.text == "📋 Adminlar Ro'yxati")
+async def list_supports(message: Message) -> None:
+    try:
+        supports = await db_get_supports()
+        if not supports:
+            await message.answer("📭 Hali yordamchi admin yo'q.", reply_markup=kb_admin_support())
+            return
+        text = "📋 <b>Yordamchi Adminlar:</b>\n\n"
+        text += "\n".join(f"{i}. @{s}" for i, s in enumerate(supports, 1))
+        await message.answer(text, reply_markup=kb_admin_support())
+    except Exception as exc:
+        logger.error("list_supports: %s", exc, exc_info=True)
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — Kino qo'shish / o'chirish (FSM)
+# ═══════════════════════════════════════════════════════════════
 
 @admin_router.message(IsAdmin(), F.text == "🎬 Kino Qo'shish")
 async def add_movie_start(message: Message, state: FSMContext) -> None:
@@ -1131,7 +1551,7 @@ async def add_movie_kod(message: Message, state: FSMContext) -> None:
             return
         kod = (message.text or "").strip()
         if not kod:
-            await message.answer("❌ Kod bo'sh bo'lmasin. Qayta yuboring:")
+            await message.answer("❌ Kod bo'sh bo'lmasin:")
             return
         await state.update_data(kino_kod=kod)
         await state.set_state(AddMovieForm.nom)
@@ -1149,7 +1569,7 @@ async def add_movie_nom(message: Message, state: FSMContext) -> None:
             return
         nom = (message.text or "").strip()
         if not nom:
-            await message.answer("❌ Nom bo'sh bo'lmasin. Qayta yuboring:")
+            await message.answer("❌ Nom bo'sh bo'lmasin:")
             return
         await state.update_data(kino_nomi=nom)
         await state.set_state(AddMovieForm.tavsif)
@@ -1168,10 +1588,7 @@ async def add_movie_tavsif(message: Message, state: FSMContext) -> None:
         tavsif = (message.text or "").strip()
         await state.update_data(kino_tavsifi=tavsif)
         await state.set_state(AddMovieForm.video)
-        await message.answer(
-            "4️⃣ Endi kinoni <b>video</b> sifatida yuboring:",
-            reply_markup=kb_cancel(),
-        )
+        await message.answer("4️⃣ Kinoni <b>video</b> sifatida yuboring:", reply_markup=kb_cancel())
     except Exception as exc:
         logger.error("add_movie_tavsif: %s", exc, exc_info=True)
 
@@ -1184,46 +1601,38 @@ async def add_movie_video(message: Message, state: FSMContext) -> None:
             await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_main())
             return
         if not message.video:
-            await message.answer(
-                "❌ Iltimos, aynan <b>video</b> yuboring (fayl emas, video!)."
-            )
+            await message.answer("❌ Iltimos, aynan <b>video</b> yuboring.")
             return
         file_id = message.video.file_id
         data    = await state.get_data()
         await state.clear()
-
         success = await db_add_movie(
-            kod=data["kino_kod"],
-            nom=data["kino_nomi"],
-            tavsif=data.get("kino_tavsifi", ""),
-            file_id=file_id,
+            kod=data["kino_kod"], nom=data["kino_nomi"],
+            tavsif=data.get("kino_tavsifi", ""), file_id=file_id,
         )
         if success:
             await message.answer(
-                f"✅ Kino muvaffaqiyatli qo'shildi!\n\n"
+                f"✅ Kino qo'shildi!\n\n"
                 f"🔑 Kod: <code>{data['kino_kod']}</code>\n"
                 f"🎬 Nom: {data['kino_nomi']}",
                 reply_markup=kb_admin_main(),
             )
         else:
             await message.answer(
-                f"⚠️ <b>{data['kino_kod']}</b> kodli kino allaqachon mavjud!\n"
-                "Boshqa kod bilan urinib ko'ring.",
+                f"⚠️ <b>{data['kino_kod']}</b> kodli kino allaqachon mavjud!",
                 reply_markup=kb_admin_main(),
             )
     except Exception as exc:
         logger.error("add_movie_video: %s", exc, exc_info=True)
         await state.clear()
-        await message.answer("❌ Xatolik yuz berdi.", reply_markup=kb_admin_main())
+        await message.answer("❌ Xatolik.", reply_markup=kb_admin_main())
 
 
 @admin_router.message(IsAdmin(), F.text == "🗑 Kino O'chirish")
 async def delete_movie_start(message: Message, state: FSMContext) -> None:
     try:
         await state.set_state(DeleteMovieForm.kod)
-        await message.answer(
-            "🗑 O'chirish uchun kino kodini yuboring:", reply_markup=kb_cancel()
-        )
+        await message.answer("🗑 O'chirish uchun kino kodini yuboring:", reply_markup=kb_cancel())
     except Exception as exc:
         logger.error("delete_movie_start: %s", exc, exc_info=True)
 
@@ -1239,13 +1648,9 @@ async def delete_movie_kod(message: Message, state: FSMContext) -> None:
         deleted = await db_delete_movie(kod)
         await state.clear()
         if deleted:
-            await message.answer(
-                f"✅ <b>{kod}</b> kodli kino o'chirildi.", reply_markup=kb_admin_main()
-            )
+            await message.answer(f"✅ <b>{kod}</b> kodli kino o'chirildi.", reply_markup=kb_admin_main())
         else:
-            await message.answer(
-                f"❌ <b>{kod}</b> kodli kino topilmadi.", reply_markup=kb_admin_main()
-            )
+            await message.answer(f"❌ <b>{kod}</b> kodli kino topilmadi.", reply_markup=kb_admin_main())
     except Exception as exc:
         logger.error("delete_movie_kod: %s", exc, exc_info=True)
         await state.clear()
@@ -1257,7 +1662,7 @@ async def list_movies(message: Message) -> None:
     try:
         movies = await db_get_all_movies()
         if not movies:
-            await message.answer("📭 Hali hech qanday kino yo'q.")
+            await message.answer("📭 Hali kino yo'q.")
             return
         header = "📋 <b>Kinolar Ro'yxati:</b>\n\n"
         rows   = [
@@ -1278,9 +1683,9 @@ async def list_movies(message: Message) -> None:
         logger.error("list_movies: %s", exc, exc_info=True)
         await message.answer("❌ Xatolik.")
 
-# ══════════════════════════════════════════════════════════════
-# ADMIN — reklama yuborish (admin_router, FSM)
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# ADMIN — Reklama yuborish (FSM)
+# ═══════════════════════════════════════════════════════════════
 
 @admin_router.message(IsAdmin(), F.text == "📢 Reklama Yuborish")
 async def broadcast_start(message: Message, state: FSMContext) -> None:
@@ -1288,7 +1693,7 @@ async def broadcast_start(message: Message, state: FSMContext) -> None:
         await state.set_state(BroadcastForm.waiting)
         await message.answer(
             "📢 <b>Reklama Yuborish</b>\n\n"
-            "Yubormoqchi bo'lgan xabaringizni yozing yoki yuboring.\n"
+            "Yubormoqchi bo'lgan xabaringizni yuboring.\n"
             "📝 Matn | 🖼 Rasm | 🎬 Video | 🎵 Audio — barchasi qabul qilinadi.",
             reply_markup=kb_cancel(),
         )
@@ -1303,23 +1708,17 @@ async def broadcast_preview(message: Message, state: FSMContext) -> None:
             await state.clear()
             await message.answer("❌ Bekor qilindi.", reply_markup=kb_admin_main())
             return
-        await state.update_data(
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
+        await state.update_data(from_chat_id=message.chat.id, message_id=message.message_id)
         await state.set_state(BroadcastForm.confirm)
         await message.answer(
-            "👆 Yuqoridagi xabar barcha foydalanuvchilarga yuboriladi.\n\n"
-            "✅ Tasdiqlaysizmi?",
+            "👆 Yuqoridagi xabar barcha foydalanuvchilarga yuboriladi.\n\n✅ Tasdiqlaysizmi?",
             reply_markup=kb_broadcast_confirm(),
         )
     except Exception as exc:
         logger.error("broadcast_preview: %s", exc, exc_info=True)
 
 
-@admin_router.callback_query(
-    IsAdmin(), F.data == "confirm_broadcast", StateFilter(BroadcastForm.confirm)
-)
+@admin_router.callback_query(IsAdmin(), F.data == "confirm_broadcast", StateFilter(BroadcastForm.confirm))
 async def broadcast_confirm(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     try:
         data = await state.get_data()
@@ -1345,22 +1744,21 @@ async def broadcast_confirm(call: CallbackQuery, state: FSMContext, bot: Bot) ->
                 ok += 1
             except TelegramForbiddenError:
                 fail += 1
-            except TelegramRetryAfter as exc:
-                await asyncio.sleep(exc.retry_after + 1)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
                 try:
                     await bot.copy_message(
-                        chat_id=uid,
-                        from_chat_id=data["from_chat_id"],
+                        chat_id=uid, from_chat_id=data["from_chat_id"],
                         message_id=data["message_id"],
                     )
                     ok += 1
                 except Exception:
                     fail += 1
-            except TelegramBadRequest as exc:
-                logger.warning("Reklama BadRequest (%s): %s", uid, exc)
+            except TelegramBadRequest as e:
+                logger.warning("Reklama BadRequest (%s): %s", uid, e)
                 fail += 1
-            except Exception as exc:
-                logger.error("Reklama xato (%s): %s", uid, exc)
+            except Exception as e:
+                logger.error("Reklama xato (%s): %s", uid, e)
                 fail += 1
 
             if i % 100 == 0:
@@ -1373,9 +1771,7 @@ async def broadcast_confirm(call: CallbackQuery, state: FSMContext, bot: Bot) ->
         try:
             await status.edit_text(
                 f"✅ <b>Reklama yakunlandi!</b>\n\n"
-                f"👥 Jami: {total}\n"
-                f"✅ Muvaffaqiyatli: {ok}\n"
-                f"❌ Bloklagan: {fail}",
+                f"👥 Jami: {total}\n✅ Yuborildi: {ok}\n❌ Bloklagan: {fail}",
             )
         except Exception:
             pass
@@ -1386,9 +1782,7 @@ async def broadcast_confirm(call: CallbackQuery, state: FSMContext, bot: Bot) ->
         await call.message.answer("❌ Xatolik.", reply_markup=kb_admin_main())
 
 
-@admin_router.callback_query(
-    IsAdmin(), F.data == "cancel_broadcast", StateFilter(BroadcastForm.confirm)
-)
+@admin_router.callback_query(IsAdmin(), F.data == "cancel_broadcast", StateFilter(BroadcastForm.confirm))
 async def broadcast_cancel(call: CallbackQuery, state: FSMContext) -> None:
     try:
         await state.clear()
@@ -1397,16 +1791,14 @@ async def broadcast_cancel(call: CallbackQuery, state: FSMContext) -> None:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await call.message.answer(
-            "❌ Reklama bekor qilindi.", reply_markup=kb_admin_main()
-        )
+        await call.message.answer("❌ Reklama bekor qilindi.", reply_markup=kb_admin_main())
     except Exception as exc:
         logger.error("broadcast_cancel: %s", exc, exc_info=True)
 
 
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # ISHGA TUSHIRISH
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
 async def main() -> None:
     await init_db()
@@ -1419,15 +1811,14 @@ async def main() -> None:
     )
 
     dp = Dispatcher(storage=MemoryStorage())
+
+    # Middleware — tartib muhim (UserTracker birinchi, Subscription keyin)
     dp.message.middleware(UserTrackerMiddleware())
     dp.callback_query.middleware(UserTrackerMiddleware())
-    # Obuna tekshiruvi — har bir xabar va callback uchun (admin bundan mustasno)
     dp.message.middleware(SubscriptionMiddleware())
     dp.callback_query.middleware(SubscriptionMiddleware())
 
-    # TARTIB MUHIM:
-    # 1. admin_router — birinchi (FSM state lari priority oladi)
-    # 2. user_router  — keyin (search_movie StateFilter(None) bilan himoyalangan)
+    # Router tartib — admin birinchi (FSM priority uchun)
     dp.include_router(admin_router)
     dp.include_router(user_router)
 
@@ -1440,7 +1831,7 @@ async def main() -> None:
         me = await bot.get_me()
         logger.info("✅ Bot ishga tushdi: @%s (ID: %d)", me.username, me.id)
     except Exception as exc:
-        logger.error("Bot ma'lumotlari: %s", exc)
+        logger.error("Bot info: %s", exc)
 
     try:
         await dp.start_polling(
