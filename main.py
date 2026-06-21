@@ -157,6 +157,7 @@ async def db_add_or_update_user(
         cur = await db.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         if row:
+            # Mavjud — faqat username, full_name, last_active yangilanadi
             await db.execute(
                 "UPDATE users SET username=?, full_name=?, last_active=? WHERE user_id=?",
                 (username, full_name, now, user_id),
@@ -164,6 +165,7 @@ async def db_add_or_update_user(
             await db.commit()
             return False
         else:
+            # Yangi foydalanuvchi — referrer_id ham saqlanadi
             await db.execute(
                 "INSERT INTO users (user_id, username, full_name, join_date, last_active,"
                 " referrer_id, balance, ref_count) VALUES (?,?,?,?,?,?,0,0)",
@@ -718,6 +720,29 @@ class UserBalanceForm(StatesGroup):
 admin_router = Router()
 user_router  = Router()
 
+# Obuna tasdiqlanmaguncha kutayotgan referal ma'lumotlari
+# { new_user_id: referrer_id }
+_pending_referrals: dict[int, int] = {}
+
+
+async def _give_referral_bonus(bot: Bot, new_user, referrer_id: int) -> None:
+    """Referal egasiga bonus berish va xabar yuborish."""
+    try:
+        await db_add_referral_bonus(referrer_id, REFERRAL_BONUS)
+        ref_data = await db_get_user(referrer_id)
+        new_bal  = ref_data.get("balance", 0) if ref_data else REFERRAL_BONUS
+        await bot.send_message(
+            referrer_id,
+            f"🎉 <b>{new_user.full_name}</b> sizning havolangiz orqali "
+            f"ro'yxatdan o'tdi!\n"
+            f"💰 Hisobingizga <b>{REFERRAL_BONUS} so'm</b> qo'shildi.\n"
+            f"💳 Umumiy balans: <b>{new_bal} so'm</b>",
+        )
+    except TelegramForbiddenError:
+        pass
+    except Exception as exc:
+        logger.error("_give_referral_bonus: %s", exc)
+
 
 # ═══════════════════════════════════════════════════════════════
 # /start — REFERAL TIZIMI BILAN
@@ -735,46 +760,75 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             try:
                 ref_id = int(args[1][4:])
                 if ref_id != user.id:
-                    referrer_id = ref_id
+                    # Referal egasi bazada borligini tekshiramiz
+                    ref_user = await db_get_user(ref_id)
+                    if ref_user:
+                        referrer_id = ref_id
             except ValueError:
                 pass
 
-        # Yangi foydalanuvchimi?
+        # Foydalanuvchi allaqachon bazada bormi?
+        existing = await db_get_user(user.id)
+
+        # Bazaga qo'shish yoki yangilash
         is_new = await db_add_or_update_user(
             user_id=user.id,
             username=user.username,
             full_name=user.full_name or str(user.id),
-            referrer_id=referrer_id,
+            referrer_id=referrer_id if not existing else None,
         )
-
-        # Referal bonusini berish — faqat yangi foydalanuvchi uchun
-        if is_new and referrer_id:
-            ref_user = await db_get_user(referrer_id)
-            if ref_user:
-                await db_add_referral_bonus(referrer_id, REFERRAL_BONUS)
-                try:
-                    await bot.send_message(
-                        referrer_id,
-                        f"🎉 <b>{user.full_name}</b> sizning havolangiz orqali botga qo'shildi!\n"
-                        f"💰 Hisobingizga <b>{REFERRAL_BONUS} so'm</b> qo'shildi.",
-                    )
-                except Exception:
-                    pass
 
         if user.id == ADMIN_ID:
             await message.answer(
                 "👋 Xush kelibsiz, <b>Admin</b>!\nBot boshqaruvi paneliga xush kelibsiz.",
                 reply_markup=kb_admin_main(),
             )
-        else:
-            txt = (
-                f"👋 Salom, <b>{user.full_name}</b>!\n\n"
-                "🎬 Kino kodini yozing — men kinoni yuboraman.\n"
-                "Masalan: <code>125</code>"
-            )
-            if is_new and referrer_id:
-                txt += f"\n\n🎁 Siz taklif orqali keldingiz!"
-            await message.answer(txt, reply_markup=kb_main_user())
+            return
+
+        # Majburiy kanallarni tekshirish
+        channels = await db_get_channels()
+        if channels:
+            not_subbed: list[dict] = []
+            for ch in channels:
+                try:
+                    member = await bot.get_chat_member(
+                        chat_id=ch["channel_username"], user_id=user.id
+                    )
+                    if member.status in ("left", "kicked"):
+                        not_subbed.append(ch)
+                except TelegramForbiddenError:
+                    logger.warning("Bot %s da admin emas.", ch["channel_username"])
+                except Exception as exc:
+                    logger.error("cmd_start sub check (%s): %s", ch["channel_username"], exc)
+
+            if not_subbed:
+                # Referal ma'lumotini callback_data ga saqlaymiz
+                # check_sub handler uni FSMContext orqali oladi
+                # Shuning uchun referer_id ni session ga saqlaymiz
+                # Lekin FSMContext /start da yo'q — bot.session ga saqlaymiz
+                # Eng oddiy yechim: pending_referrals lug'ati
+                if is_new and referrer_id:
+                    _pending_referrals[user.id] = referrer_id
+
+                await message.answer(
+                    "⚠️ <b>Botdan foydalanish uchun kanallarga obuna bo'ling:</b>\n\n"
+                    "Obuna bo'lgach <b>«✅ Obunani Tekshirish»</b> tugmasini bosing.",
+                    reply_markup=kb_subscribe(not_subbed),
+                )
+                return
+
+        # Kanallar yo'q yoki hammaga obuna — to'g'ridan kirish
+        # Bonus faqat yangi foydalanuvchi uchun
+        if is_new and referrer_id:
+            await _give_referral_bonus(bot, user, referrer_id)
+
+        await message.answer(
+            f"👋 Salom, <b>{user.full_name}</b>!\n\n"
+            "🎬 Kino kodini yozing — men kinoni yuboraman.\n"
+            "Masalan: <code>125</code>"
+            + ("\n\n🎁 Siz taklif orqali keldingiz!" if is_new and referrer_id else ""),
+            reply_markup=kb_main_user(),
+        )
     except Exception as exc:
         logger.error("cmd_start: %s", exc, exc_info=True)
 
@@ -892,55 +946,85 @@ async def cmd_help(message: Message) -> None:
 
 @user_router.callback_query(F.data == "check_sub")
 async def check_sub_cb(call: CallbackQuery, bot: Bot) -> None:
+    """'Tekshirish' tugmasi — Telegram kanallarni tekshiradi."""
     try:
+        user = call.from_user
         channels = await db_get_channels()
+
+        # Kanallar yo'q — to'g'ridan ruxsat
         if not channels:
-            await call.answer("✅ Ruxsat berildi!", show_alert=True)
+            await call.answer("✅ Tasdiqlandi!", show_alert=False)
             try:
                 await call.message.delete()
             except Exception:
                 pass
+            # Pending referal bormi?
+            referrer_id = _pending_referrals.pop(user.id, None)
+            if referrer_id:
+                await _give_referral_bonus(bot, user, referrer_id)
+
             await call.message.answer(
-                f"✅ Botdan foydalanishingiz mumkin!\n"
+                f"✅ <b>Ro'yxatdan o'tdingiz!</b>\n\n"
+                f"👋 Salom, <b>{user.full_name}</b>!\n"
                 "🎬 Kino kodini yozing. Masalan: <code>125</code>",
                 reply_markup=kb_main_user(),
             )
             return
 
+        # Har bir kanalga obunani tekshirish
         not_subbed: list[dict] = []
         for ch in channels:
             try:
                 member = await bot.get_chat_member(
-                    chat_id=ch["channel_username"], user_id=call.from_user.id
+                    chat_id=ch["channel_username"], user_id=user.id
                 )
                 if member.status in ("left", "kicked"):
                     not_subbed.append(ch)
             except TelegramForbiddenError:
                 logger.warning("Bot %s da admin emas.", ch["channel_username"])
+            except TelegramBadRequest as exc:
+                logger.warning("check_sub_cb (%s): %s", ch["channel_username"], exc)
             except Exception as exc:
                 logger.error("check_sub_cb (%s): %s", ch["channel_username"], exc)
 
         if not_subbed:
-            await call.answer("❌ Hali barcha kanallarga obuna bo'lmagansiz!", show_alert=True)
+            # Hali obuna bo'lmagan kanallar bor
+            await call.answer(
+                "❌ Hali barcha kanallarga obuna bo'lmagansiz!",
+                show_alert=True,
+            )
             try:
-                await call.message.edit_reply_markup(reply_markup=kb_subscribe(not_subbed))
+                await call.message.edit_reply_markup(
+                    reply_markup=kb_subscribe(not_subbed)
+                )
             except Exception:
                 pass
         else:
-            await call.answer("✅ Obuna tasdiqlandi!", show_alert=True)
+            # Barcha kanallarga obuna — tasdiqlandi
+            await call.answer("✅ Obuna tasdiqlandi!", show_alert=False)
             try:
                 await call.message.delete()
             except Exception:
                 pass
+
+            # Pending referal bonusini berish
+            referrer_id = _pending_referrals.pop(user.id, None)
+            if referrer_id:
+                await _give_referral_bonus(bot, user, referrer_id)
+                welcome_extra = "\n\n🎁 Siz taklif orqali keldingiz!"
+            else:
+                welcome_extra = ""
+
             await call.message.answer(
-                f"✅ <b>Obuna tasdiqlandi!</b>\n\n"
-                f"👋 Salom, <b>{call.from_user.full_name}</b>!\n"
-                "🎬 Kino kodini yozing. Masalan: <code>125</code>",
+                f"✅ <b>Ro'yxatdan o'tdingiz!</b>\n\n"
+                f"👋 Salom, <b>{user.full_name}</b>!\n"
+                f"🎬 Kino kodini yozing. Masalan: <code>125</code>"
+                f"{welcome_extra}",
                 reply_markup=kb_main_user(),
             )
     except Exception as exc:
         logger.error("check_sub_cb: %s", exc, exc_info=True)
-        await call.answer("❌ Xatolik.", show_alert=True)
+        await call.answer("❌ Xatolik yuz berdi.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════
 # FOYDALANUVCHI — kino qidirish
